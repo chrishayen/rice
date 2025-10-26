@@ -1,0 +1,6 @@
+[submodule "libs/des"]
+	path = libs/des
+	url = https://github.com/chrishayen/des
+[submodule "libs/tinyuz"]
+	path = libs/tinyuz
+	url = https://github.com/chrishayen/tinyuz
