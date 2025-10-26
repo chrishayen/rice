@@ -4,12 +4,12 @@
 
 package main
 
-import "core:fmt"
+import "base:runtime"
 import "core:c"
+import "core:encoding/json"
+import "core:fmt"
 import "core:math"
 import "core:strings"
-import "core:encoding/json"
-import "base:runtime"
 import rl "ricelib"
 
 // GTK4 + libadwaita bindings
@@ -24,10 +24,12 @@ foreign import cairo "system:cairo"
 GtkWidget :: distinct rawptr
 GtkApplication :: distinct rawptr
 GtkWindow :: distinct rawptr
+GdkSurface :: distinct rawptr
 GtkBox :: distinct rawptr
 GtkPaned :: distinct rawptr
 GtkLabel :: distinct rawptr
 GtkButton :: distinct rawptr
+GtkToggleButton :: distinct rawptr
 GtkScale :: distinct rawptr
 GtkAdjustment :: distinct rawptr
 GtkDrawingArea :: distinct rawptr
@@ -35,6 +37,8 @@ GtkColorButton :: distinct rawptr
 GtkCheckButton :: distinct rawptr
 GtkFrame :: distinct rawptr
 GtkScrolledWindow :: distinct rawptr
+GtkDropDown :: distinct rawptr
+GtkStringList :: distinct rawptr
 GApplication :: distinct rawptr
 
 // Adwaita types
@@ -48,33 +52,33 @@ AdwTabBar :: distinct rawptr
 AdwTabPage :: distinct rawptr
 
 GdkRGBA :: struct {
-	red: c.double,
+	red:   c.double,
 	green: c.double,
-	blue: c.double,
+	blue:  c.double,
 	alpha: c.double,
 }
 cairo_t :: distinct rawptr
 
 GtkOrientation :: enum c.int {
 	HORIZONTAL = 0,
-	VERTICAL = 1,
+	VERTICAL   = 1,
 }
 
 GtkAlign :: enum c.int {
-	FILL = 0,
-	START = 1,
-	END = 2,
+	FILL   = 0,
+	START  = 1,
+	END    = 2,
 	CENTER = 3,
 }
 
 GtkPolicyType :: enum c.int {
-	ALWAYS = 0,
+	ALWAYS    = 0,
 	AUTOMATIC = 1,
-	NEVER = 2,
+	NEVER     = 2,
 }
 
 // GTK functions
-@(default_calling_convention="c")
+@(default_calling_convention = "c")
 foreign gtk {
 	gtk_init :: proc() ---
 
@@ -89,6 +93,8 @@ foreign gtk {
 	gtk_paned_set_position :: proc(paned: GtkPaned, position: c.int) ---
 	gtk_paned_set_resize_start_child :: proc(paned: GtkPaned, resize: c.bool) ---
 	gtk_paned_set_shrink_start_child :: proc(paned: GtkPaned, shrink: c.bool) ---
+	gtk_paned_set_resize_end_child :: proc(paned: GtkPaned, resize: c.bool) ---
+	gtk_paned_set_shrink_end_child :: proc(paned: GtkPaned, shrink: c.bool) ---
 
 	gtk_label_new :: proc(text: cstring) -> GtkWidget ---
 	gtk_label_set_markup :: proc(label: GtkLabel, markup: cstring) ---
@@ -96,6 +102,10 @@ foreign gtk {
 	gtk_label_set_wrap :: proc(label: GtkLabel, wrap: c.bool) ---
 
 	gtk_button_new_with_label :: proc(label: cstring) -> GtkWidget ---
+
+	gtk_toggle_button_new :: proc() -> GtkWidget ---
+	gtk_toggle_button_set_active :: proc(button: GtkToggleButton, is_active: c.bool) ---
+	gtk_toggle_button_get_active :: proc(button: GtkToggleButton) -> c.bool ---
 
 	gtk_scale_new_with_range :: proc(orientation: GtkOrientation, min, max, step: c.double) -> GtkWidget ---
 	gtk_scale_set_digits :: proc(scale: GtkScale, digits: c.int) ---
@@ -135,18 +145,29 @@ foreign gtk {
 	gtk_widget_set_size_request :: proc(widget: GtkWidget, width, height: c.int) ---
 	gtk_widget_queue_draw :: proc(widget: GtkWidget) ---
 	gtk_widget_add_css_class :: proc(widget: GtkWidget, css_class: cstring) ---
+
+	gtk_window_set_default_size :: proc(window: GtkWindow, width, height: c.int) ---
+	gtk_native_get_surface :: proc(native: rawptr) -> GdkSurface ---
+
+	gtk_string_list_new :: proc(strings: ^cstring) -> GtkStringList ---
+	gtk_string_list_append :: proc(list: GtkStringList, string: cstring) ---
+	gtk_drop_down_new :: proc(model: rawptr, expression: rawptr) -> GtkWidget ---
+	gtk_drop_down_set_selected :: proc(dropdown: GtkDropDown, position: c.uint) ---
+	gtk_drop_down_get_selected :: proc(dropdown: GtkDropDown) -> c.uint ---
 }
 
 // Adwaita functions
-@(default_calling_convention="c")
+@(default_calling_convention = "c")
 foreign adw {
 	adw_application_new :: proc(app_id: cstring, flags: c.int) -> AdwApplication ---
 	adw_application_window_new :: proc(app: AdwApplication) -> GtkWidget ---
 	adw_application_window_set_content :: proc(window: AdwApplicationWindow, content: GtkWidget) ---
+	adw_window_title_new :: proc(title: cstring, subtitle: cstring) -> GtkWidget ---
 
 	adw_header_bar_new :: proc() -> GtkWidget ---
 	adw_header_bar_pack_start :: proc(header: AdwHeaderBar, child: GtkWidget) ---
 	adw_header_bar_pack_end :: proc(header: AdwHeaderBar, child: GtkWidget) ---
+	adw_header_bar_set_title_widget :: proc(header: AdwHeaderBar, widget: GtkWidget) ---
 
 	adw_preferences_group_new :: proc() -> GtkWidget ---
 	adw_preferences_group_set_title :: proc(group: AdwPreferencesGroup, title: cstring) ---
@@ -174,24 +195,24 @@ foreign adw {
 }
 
 // GIO functions
-@(default_calling_convention="c")
+@(default_calling_convention = "c")
 foreign gio {
 	g_application_run :: proc(app: GApplication, argc: c.int, argv: rawptr) -> c.int ---
 }
 
-@(default_calling_convention="c")
+@(default_calling_convention = "c")
 foreign gobject {
 	g_signal_connect_data :: proc(instance: rawptr, detailed_signal: cstring, c_handler: rawptr, data: rawptr, destroy_data: rawptr, connect_flags: c.int) -> c.ulong ---
 	g_object_unref :: proc(object: rawptr) ---
 }
 
-@(default_calling_convention="c")
+@(default_calling_convention = "c")
 foreign glib {
 	g_timeout_add :: proc(interval: c.uint, function: rawptr, data: rawptr) -> c.uint ---
 }
 
 // Cairo functions
-@(default_calling_convention="c")
+@(default_calling_convention = "c")
 foreign cairo {
 	cairo_set_source_rgb :: proc(cr: cairo_t, r, g, b: c.double) ---
 	cairo_set_source_rgba :: proc(cr: cairo_t, r, g, b, a: c.double) ---
@@ -212,47 +233,52 @@ foreign cairo {
 cairo_text_extents_t :: struct {
 	x_bearing: c.double,
 	y_bearing: c.double,
-	width: c.double,
-	height: c.double,
+	width:     c.double,
+	height:    c.double,
 	x_advance: c.double,
 	y_advance: c.double,
 }
 
 // Application state
 App_State :: struct {
-	window: AdwApplicationWindow,
-	selected_effect: int,
-	color1: GdkRGBA,
-	color2: GdkRGBA,
-	brightness: f64,
+	window:                AdwApplicationWindow,
+	selected_effect:       int,
+	color1:                GdkRGBA,
+	color2:                GdkRGBA,
+	brightness:            f64,
 
 	// Widgets
-	preview_area: GtkDrawingArea,
-	brightness_scale: GtkScale,
-	color1_button: GtkColorButton,
-	color2_button: GtkColorButton,
-	effect_checks: [12]GtkCheckButton,
-	device_list_box: GtkBox,
+	preview_area:          GtkDrawingArea,
+	brightness_scale:      GtkScale,
+	color1_button:         GtkColorButton,
+	color2_button:         GtkColorButton,
+	effect_dropdown:       GtkDropDown,
+	device_list_box:       GtkBox,
+	device_toggle_buttons: [dynamic]GtkToggleButton,
 
 	// Preview data
-	led_colors: [dynamic][3]u8,
-	devices: [dynamic]Device,
+	led_colors:            [dynamic][3]u8,
+	devices:               [dynamic]Device,
+	selected_devices:      [dynamic]bool,
+
+	// Flag to prevent individual identify during batch operations
+	batch_selecting:       bool,
 }
 
 Device :: struct {
-	mac_str: string,
-	rx_type: u8,
-	channel: u8,
-	bound: bool,
+	mac_str:   string,
+	rx_type:   u8,
+	channel:   u8,
+	bound:     bool,
 	led_count: int,
 	fan_count: int,
 }
 
 Effect_Info :: struct {
-	name: string,
+	name:        string,
 	description: string,
-	has_color1: bool,
-	has_color2: bool,
+	has_color1:  bool,
+	has_color2:  bool,
 }
 
 EFFECTS := [?]Effect_Info {
@@ -286,9 +312,11 @@ run_ui :: proc() {
 	state.color2 = {0.0, 0.0, 1.0, 1.0}
 	state.brightness = 100.0
 	state.devices = make([dynamic]Device)
+	state.selected_devices = make([dynamic]bool)
+	state.device_toggle_buttons = make([dynamic]GtkToggleButton)
 
 	// Create Adwaita application
-	app := adw_application_new("com.lianli.fancontrol", 0)
+	app := adw_application_new("dev.shotgun.rice", 0)
 	g_signal_connect_data(app, "activate", auto_cast on_activate, state, nil, 0)
 
 	status := g_application_run(auto_cast app, 0, nil)
@@ -296,6 +324,8 @@ run_ui :: proc() {
 	// Cleanup
 	delete(state.led_colors)
 	delete(state.devices)
+	delete(state.selected_devices)
+	delete(state.device_toggle_buttons)
 }
 
 on_activate :: proc "c" (app: AdwApplication, user_data: rawptr) {
@@ -307,7 +337,8 @@ on_activate :: proc "c" (app: AdwApplication, user_data: rawptr) {
 	window := auto_cast adw_application_window_new(app)
 	state.window = auto_cast window
 
-	gtk_widget_set_size_request(window, 1200, 800)
+	// Set default size instead of size request for better floating window behavior
+	gtk_window_set_default_size(auto_cast window, 1200, 800)
 
 	// Main container
 	main_box := auto_cast gtk_box_new(.VERTICAL, 0)
@@ -315,6 +346,10 @@ on_activate :: proc "c" (app: AdwApplication, user_data: rawptr) {
 	// Header bar
 	header := auto_cast adw_header_bar_new()
 	gtk_box_prepend(auto_cast main_box, header)
+
+	// Set window title
+	title_widget := adw_window_title_new("Rice Studio Beta", "")
+	adw_header_bar_set_title_widget(auto_cast header, title_widget)
 
 	// Refresh button
 	refresh_btn := auto_cast gtk_button_new_with_label("Refresh Devices")
@@ -342,8 +377,14 @@ on_activate :: proc "c" (app: AdwApplication, user_data: rawptr) {
 	adw_application_window_set_content(auto_cast window, main_box)
 
 	// Show window
-	gtk_widget_set_size_request(window, 1200, 800)
-	g_signal_connect_data(window, "close-request", auto_cast proc "c" () -> c.bool { return false }, nil, nil, 0)
+	g_signal_connect_data(
+		window,
+		"close-request",
+		auto_cast proc "c" () -> c.bool {return false},
+		nil,
+		nil,
+		0,
+	)
 
 	// Manual show
 	foreign gtk {
@@ -377,11 +418,29 @@ build_device_panel :: proc(state: ^App_State) -> GtkWidget {
 	gtk_widget_set_margin_top(box, 12)
 	gtk_widget_set_margin_bottom(box, 12)
 
+	// Header with title and select all button
+	header_box := auto_cast gtk_box_new(.HORIZONTAL, 12)
+	gtk_box_append(auto_cast box, header_box)
+
 	// Title
 	title := auto_cast gtk_label_new("Devices")
 	gtk_label_set_markup(auto_cast title, "<span size='14000' weight='bold'>Devices</span>")
 	gtk_label_set_xalign(auto_cast title, 0.0)
-	gtk_box_append(auto_cast box, title)
+	gtk_widget_set_hexpand(title, true)
+	gtk_box_append(auto_cast header_box, title)
+
+	// Select All button
+	select_all_btn := auto_cast gtk_button_new_with_label("Select All")
+	gtk_widget_add_css_class(select_all_btn, "flat")
+	g_signal_connect_data(
+		select_all_btn,
+		"clicked",
+		auto_cast on_select_all_clicked,
+		state,
+		nil,
+		0,
+	)
+	gtk_box_append(auto_cast header_box, select_all_btn)
 
 	// Scrolled window for devices
 	scrolled := auto_cast gtk_scrolled_window_new()
@@ -423,33 +482,41 @@ rebuild_device_list :: proc(state: ^App_State) {
 		child = next_child
 	}
 
+	// Clear toggle buttons and selection arrays
+	clear(&state.device_toggle_buttons)
+	clear(&state.selected_devices)
+
 	// Add new device cards
+	device_idx := 0
 	for device in state.devices {
 		if device.rx_type == 255 do continue
 
-		card := build_device_card(device)
+		card := build_device_card(device, state, device_idx)
 		gtk_box_append(state.device_list_box, card)
+
+		append(&state.selected_devices, false)
+		device_idx += 1
 	}
 }
 
-build_device_card :: proc(device: Device) -> GtkWidget {
-	// Create a button so the device card is clickable
+build_device_card :: proc(device: Device, state: ^App_State, device_idx: int) -> GtkWidget {
+	// Create a toggle button so the device card is selectable
 	foreign gtk {
-		gtk_button_new :: proc() -> GtkWidget ---
 		gtk_button_set_child :: proc(button: GtkButton, child: GtkWidget) ---
 	}
 
-	button := auto_cast gtk_button_new()
+	button := auto_cast gtk_toggle_button_new()
 	gtk_widget_add_css_class(button, "card")
 	gtk_widget_set_margin_top(button, 3)
 	gtk_widget_set_margin_bottom(button, 3)
 
-	// Store device info for click handler
-	device_copy := new(Device)
-	device_copy^ = device
+	// Store the toggle button
+	append(&state.device_toggle_buttons, auto_cast button)
 
-	// Connect click handler
-	g_signal_connect_data(button, "clicked", auto_cast on_device_clicked, device_copy, nil, 0)
+	// Connect toggle handler
+	toggle_data := new(int)
+	toggle_data^ = device_idx
+	g_signal_connect_data(button, "toggled", auto_cast on_device_toggled, toggle_data, nil, 0)
 
 	box := auto_cast gtk_box_new(.VERTICAL, 6)
 	gtk_widget_set_margin_start(box, 12)
@@ -462,21 +529,33 @@ build_device_card :: proc(device: Device) -> GtkWidget {
 	mac_cstr := strings.clone_to_cstring(device.mac_str)
 	defer delete(mac_cstr)
 	mac_label := auto_cast gtk_label_new(mac_cstr)
-	gtk_label_set_markup(auto_cast mac_label, fmt.ctprintf("<span weight='bold' size='12000'>%s</span>", mac_cstr))
+	gtk_label_set_markup(
+		auto_cast mac_label,
+		fmt.ctprintf("<span weight='bold' size='12000'>%s</span>", mac_cstr),
+	)
 	gtk_label_set_xalign(auto_cast mac_label, 0.0)
 	gtk_box_append(auto_cast box, mac_label)
 
 	// Type info
 	type_name: cstring
 	switch device.rx_type {
-	case 1: type_name = "SL-LCD"
-	case 2: type_name = "TL"
-	case 3: type_name = "TL3"
-	case: type_name = "Unknown"
+	case 1:
+		type_name = "SL-LCD"
+	case 2:
+		type_name = "TL"
+	case 3:
+		type_name = "TL3"
+	case:
+		type_name = "Unknown"
 	}
 
-	info_label := auto_cast gtk_label_new(fmt.ctprintf("%s • Channel %d", type_name, device.channel))
-	gtk_label_set_markup(auto_cast info_label, fmt.ctprintf("<span size='10000'>%s • Channel %d</span>", type_name, device.channel))
+	info_label := auto_cast gtk_label_new(
+		fmt.ctprintf("%s • Channel %d", type_name, device.channel),
+	)
+	gtk_label_set_markup(
+		auto_cast info_label,
+		fmt.ctprintf("<span size='10000'>%s • Channel %d</span>", type_name, device.channel),
+	)
 	gtk_label_set_xalign(auto_cast info_label, 0.0)
 	gtk_box_append(auto_cast box, info_label)
 
@@ -484,8 +563,14 @@ build_device_card :: proc(device: Device) -> GtkWidget {
 	status_color := device.bound ? "success" : "warning"
 	status_text: cstring = device.bound ? "Bound" : "Unbound"
 	status_label := auto_cast gtk_label_new(status_text)
-	gtk_label_set_markup(auto_cast status_label, fmt.ctprintf("<span size='10000' foreground='%s'>%s</span>",
-		device.bound ? "#26a269" : "#e5a50a", status_text))
+	gtk_label_set_markup(
+		auto_cast status_label,
+		fmt.ctprintf(
+			"<span size='10000' foreground='%s'>%s</span>",
+			device.bound ? "#26a269" : "#e5a50a",
+			status_text,
+		),
+	)
 	gtk_label_set_xalign(auto_cast status_label, 0.0)
 	gtk_box_append(auto_cast box, status_label)
 
@@ -526,15 +611,17 @@ build_tabs :: proc(state: ^App_State) -> GtkWidget {
 build_led_effects_page :: proc(state: ^App_State) -> GtkWidget {
 	paned := auto_cast gtk_paned_new(.HORIZONTAL)
 
-	// Left: controls
-	controls := build_effect_controls(state)
-	gtk_paned_set_start_child(auto_cast paned, controls)
-
-	// Right: preview
+	// Left: preview
 	preview := build_preview_panel(state)
-	gtk_paned_set_end_child(auto_cast paned, preview)
+	gtk_paned_set_start_child(auto_cast paned, preview)
 
-	gtk_paned_set_position(auto_cast paned, 400)
+	// Right: controls
+	controls := build_effect_controls(state)
+	gtk_paned_set_end_child(auto_cast paned, controls)
+	gtk_paned_set_resize_end_child(auto_cast paned, false)
+	gtk_paned_set_shrink_end_child(auto_cast paned, false)
+
+	gtk_paned_set_position(auto_cast paned, 800)
 
 	return paned
 }
@@ -556,52 +643,35 @@ build_effect_controls :: proc(state: ^App_State) -> GtkWidget {
 	adw_preferences_group_set_description(auto_cast effect_group, "Choose an LED animation effect")
 	gtk_box_append(auto_cast box, effect_group)
 
-	first_check: GtkCheckButton
-	for effect, i in EFFECTS {
-		row := auto_cast adw_action_row_new()
+	// Effect selector row
+	effect_row := auto_cast adw_action_row_new()
+	adw_preferences_row_set_title(effect_row, "LED Effect")
 
+	// Create string list for dropdown
+	string_list := gtk_string_list_new(nil)
+	for effect in EFFECTS {
 		name_cstr := strings.clone_to_cstring(effect.name)
 		defer delete(name_cstr)
-		desc_cstr := strings.clone_to_cstring(effect.description)
-		defer delete(desc_cstr)
+		gtk_string_list_append(string_list, name_cstr)
+	}
 
-		adw_preferences_row_set_title(row, name_cstr)
-		adw_action_row_set_subtitle(auto_cast row, desc_cstr)
+	// Create dropdown
+	state.effect_dropdown = auto_cast gtk_drop_down_new(string_list, nil)
+	gtk_drop_down_set_selected(state.effect_dropdown, 0)
+	adw_action_row_add_suffix(auto_cast effect_row, auto_cast state.effect_dropdown)
+	adw_preferences_group_add(auto_cast effect_group, effect_row)
 
-		check := auto_cast gtk_check_button_new()
-		state.effect_checks[i] = auto_cast check
-
-		if i == 0 {
-			first_check = auto_cast check
-			gtk_check_button_set_active(auto_cast check, true)
-		} else {
-			gtk_check_button_set_group(auto_cast check, first_check)
-		}
-
-		adw_action_row_add_prefix(auto_cast row, check)
-		adw_action_row_set_activatable_widget(auto_cast row, check)
-
-		adw_preferences_group_add(auto_cast effect_group, row)
-
-		// Connect signal - use global state and store index in check button
-		g_signal_connect_data(check, "toggled", auto_cast proc "c" (check: GtkCheckButton, user_data: rawptr) {
+	// Connect signal for dropdown
+	g_signal_connect_data(state.effect_dropdown, "notify::selected", auto_cast proc "c" (dropdown: GtkDropDown, pspec: rawptr, user_data: rawptr) {
 			context = runtime.default_context()
 			state := global_state
 			if state == nil do return
 
-			// Find which check button was activated
-			if gtk_check_button_get_active(check) {
-				for j in 0..<len(state.effect_checks) {
-					if state.effect_checks[j] == check {
-						state.selected_effect = j
-						break
-					}
-				}
-			}
+			selected := gtk_drop_down_get_selected(dropdown)
+			state.selected_effect = int(selected)
 		}, nil, nil, 0)
-	}
 
-	// Color group
+	// Color controls
 	color_group := auto_cast adw_preferences_group_new()
 	adw_preferences_group_set_title(auto_cast color_group, "Colors")
 	gtk_box_append(auto_cast box, color_group)
@@ -622,7 +692,7 @@ build_effect_controls :: proc(state: ^App_State) -> GtkWidget {
 	adw_action_row_add_suffix(auto_cast color2_row, auto_cast state.color2_button)
 	adw_preferences_group_add(auto_cast color_group, color2_row)
 
-	// Brightness group
+	// Brightness control
 	brightness_group := auto_cast adw_preferences_group_new()
 	adw_preferences_group_set_title(auto_cast brightness_group, "Brightness")
 	gtk_box_append(auto_cast box, brightness_group)
@@ -640,7 +710,7 @@ build_effect_controls :: proc(state: ^App_State) -> GtkWidget {
 
 	adw_preferences_group_add(auto_cast brightness_group, brightness_row)
 
-	// Buttons
+	// Action buttons
 	button_box := auto_cast gtk_box_new(.HORIZONTAL, 12)
 	gtk_widget_set_halign(button_box, .CENTER)
 	gtk_widget_set_margin_top(button_box, 20)
@@ -663,11 +733,15 @@ build_effect_controls :: proc(state: ^App_State) -> GtkWidget {
 }
 
 build_preview_panel :: proc(state: ^App_State) -> GtkWidget {
+	scrolled := auto_cast gtk_scrolled_window_new()
+	gtk_scrolled_window_set_policy(auto_cast scrolled, .NEVER, .AUTOMATIC)
+
 	box := auto_cast gtk_box_new(.VERTICAL, 12)
 	gtk_widget_set_margin_start(box, 20)
 	gtk_widget_set_margin_end(box, 20)
 	gtk_widget_set_margin_top(box, 20)
 	gtk_widget_set_margin_bottom(box, 20)
+	gtk_scrolled_window_set_child(auto_cast scrolled, box)
 
 	title := auto_cast gtk_label_new("Effect Preview")
 	gtk_label_set_markup(auto_cast title, "<span size='13000' weight='bold'>Effect Preview</span>")
@@ -686,7 +760,7 @@ build_preview_panel :: proc(state: ^App_State) -> GtkWidget {
 	gtk_drawing_area_set_draw_func(state.preview_area, draw_preview, state, nil)
 	gtk_frame_set_child(auto_cast frame, auto_cast state.preview_area)
 
-	return box
+	return scrolled
 }
 
 build_lcd_page :: proc(state: ^App_State) -> GtkWidget {
@@ -695,7 +769,10 @@ build_lcd_page :: proc(state: ^App_State) -> GtkWidget {
 	gtk_widget_set_margin_top(box, 40)
 
 	title := auto_cast gtk_label_new("LCD Display Control")
-	gtk_label_set_markup(auto_cast title, "<span size='18000' weight='bold'>LCD Display Control</span>")
+	gtk_label_set_markup(
+		auto_cast title,
+		"<span size='18000' weight='bold'>LCD Display Control</span>",
+	)
 	gtk_box_append(auto_cast box, title)
 
 	desc := auto_cast gtk_label_new("(Coming soon)")
@@ -719,7 +796,10 @@ build_settings_page :: proc(state: ^App_State) -> GtkWidget {
 	// Channel settings
 	channel_group := auto_cast adw_preferences_group_new()
 	adw_preferences_group_set_title(auto_cast channel_group, "RF Channel")
-	adw_preferences_group_set_description(auto_cast channel_group, "Configure the wireless RF channel")
+	adw_preferences_group_set_description(
+		auto_cast channel_group,
+		"Configure the wireless RF channel",
+	)
 	gtk_box_append(auto_cast box, channel_group)
 
 	channel_row := auto_cast adw_action_row_new()
@@ -731,7 +811,12 @@ build_settings_page :: proc(state: ^App_State) -> GtkWidget {
 }
 
 // Drawing function for preview
-draw_preview :: proc "c" (area: GtkDrawingArea, cr: cairo_t, width, height: c.int, user_data: rawptr) {
+draw_preview :: proc "c" (
+	area: GtkDrawingArea,
+	cr: cairo_t,
+	width, height: c.int,
+	user_data: rawptr,
+) {
 	context = runtime.default_context()
 
 	state := cast(^App_State)user_data
@@ -745,7 +830,7 @@ draw_preview :: proc "c" (area: GtkDrawingArea, cr: cairo_t, width, height: c.in
 		cairo_set_source_rgb(cr, 0.5, 0.5, 0.5)
 		cairo_select_font_face(cr, "Inter", 0, 0)
 		cairo_set_font_size(cr, 16)
-		cairo_move_to(cr, c.double(width)/2 - 80, c.double(height)/2)
+		cairo_move_to(cr, c.double(width) / 2 - 80, c.double(height) / 2)
 		cairo_show_text(cr, "No devices configured")
 		return
 	}
@@ -768,7 +853,7 @@ draw_preview :: proc "c" (area: GtkDrawingArea, cr: cairo_t, width, height: c.in
 	fan_idx := 0
 
 	for device in state.devices {
-		for fan in 0..<device.fan_count {
+		for fan in 0 ..< device.fan_count {
 			row := fan_idx / cols
 			col := fan_idx % cols
 
@@ -777,7 +862,15 @@ draw_preview :: proc "c" (area: GtkDrawingArea, cr: cairo_t, width, height: c.in
 
 			leds_per_fan := device.led_count / device.fan_count
 
-			draw_fan_hexagon(cr, center_x, center_y, leds_per_fan, led_offset, state, device.rx_type)
+			draw_fan_hexagon(
+				cr,
+				center_x,
+				center_y,
+				leds_per_fan,
+				led_offset,
+				state,
+				device.rx_type,
+			)
 
 			led_offset += leds_per_fan
 			fan_idx += 1
@@ -785,12 +878,18 @@ draw_preview :: proc "c" (area: GtkDrawingArea, cr: cairo_t, width, height: c.in
 	}
 }
 
-draw_fan_hexagon :: proc(cr: cairo_t, center_x, center_y: f64, num_leds, led_offset: int, state: ^App_State, rx_type: u8) {
+draw_fan_hexagon :: proc(
+	cr: cairo_t,
+	center_x, center_y: f64,
+	num_leds, led_offset: int,
+	state: ^App_State,
+	rx_type: u8,
+) {
 	FAN_RADIUS :: 60.0
 	LED_RADIUS :: 4.0
 
 	// Draw hexagon outline
-	for i in 0..<6 {
+	for i in 0 ..< 6 {
 		angle1 := f64(i) / 6.0 * 2.0 * math.PI - math.PI / 2.0
 		angle2 := f64(i + 1) / 6.0 * 2.0 * math.PI - math.PI / 2.0
 
@@ -810,7 +909,7 @@ draw_fan_hexagon :: proc(cr: cairo_t, center_x, center_y: f64, num_leds, led_off
 	// Draw LEDs
 	leds_per_edge := f64(num_leds) / 6.0
 
-	for edge in 0..<6 {
+	for edge in 0 ..< 6 {
 		angle1 := f64(edge) / 6.0 * 2.0 * math.PI - math.PI / 2.0
 		angle2 := f64(edge + 1) / 6.0 * 2.0 * math.PI - math.PI / 2.0
 
@@ -823,7 +922,7 @@ draw_fan_hexagon :: proc(cr: cairo_t, center_x, center_y: f64, num_leds, led_off
 		edge_end_led := int(f64(edge + 1) * leds_per_edge)
 		edge_led_count := edge_end_led - edge_start_led
 
-		for i in 0..<edge_led_count {
+		for i in 0 ..< edge_led_count {
 			t := (f64(i) + 0.5) / f64(edge_led_count)
 
 			led_x := p1x + t * (p2x - p1x)
@@ -859,10 +958,14 @@ draw_fan_hexagon :: proc(cr: cairo_t, center_x, center_y: f64, num_leds, led_off
 	// Draw label
 	type_label: cstring
 	switch rx_type {
-	case 1: type_label = "SL"
-	case 2: type_label = "TL"
-	case 3: type_label = "TL3"
-	case: type_label = "?"
+	case 1:
+		type_label = "SL"
+	case 2:
+		type_label = "TL"
+	case 3:
+		type_label = "TL3"
+	case:
+		type_label = "?"
 	}
 
 	cairo_set_source_rgb(cr, 0.7, 0.7, 0.7)
@@ -876,14 +979,62 @@ draw_fan_hexagon :: proc(cr: cairo_t, center_x, center_y: f64, num_leds, led_off
 }
 
 // Callbacks
-on_device_clicked :: proc "c" (button: GtkButton, user_data: rawptr) {
+on_device_toggled :: proc "c" (button: GtkToggleButton, user_data: rawptr) {
 	context = runtime.default_context()
-	device := cast(^Device)user_data
+	state := global_state
+	if state == nil do return
 
-	fmt.printfln("Identifying device: %s", device.mac_str)
+	device_idx := cast(^int)user_data
+	if device_idx^ >= 0 && device_idx^ < len(state.selected_devices) {
+		is_active := gtk_toggle_button_get_active(button)
+		state.selected_devices[device_idx^] = bool(is_active)
 
-	// Send identify request to service
-	send_identify_request(device^)
+		if is_active {
+			fmt.printfln("Selected device %d", device_idx^)
+
+			// Only send identify if not in batch mode
+			if !state.batch_selecting && device_idx^ < len(state.devices) {
+				device := state.devices[device_idx^]
+				fmt.printfln("Identifying device: %s", device.mac_str)
+				send_identify_request(device)
+			}
+		} else {
+			fmt.printfln("Deselected device %d", device_idx^)
+		}
+	}
+}
+
+on_select_all_clicked :: proc "c" (button: GtkButton, user_data: rawptr) {
+	context = runtime.default_context()
+	state := cast(^App_State)user_data
+
+	// Set batch mode flag to prevent individual identify calls
+	state.batch_selecting = true
+
+	// Build list of valid devices to identify
+	devices_to_identify := make([dynamic]Device, 0, len(state.devices))
+	defer delete(devices_to_identify)
+
+	for device in state.devices {
+		if device.rx_type == 255 do continue
+		append(&devices_to_identify, device)
+	}
+
+	// Send identify requests for all devices at once (single IPC call)
+	if len(devices_to_identify) > 0 {
+		fmt.printfln("Identifying %d device(s)", len(devices_to_identify))
+		send_identify_requests(devices_to_identify[:])
+	}
+
+	// Then toggle all devices on
+	for toggle_btn in state.device_toggle_buttons {
+		gtk_toggle_button_set_active(toggle_btn, true)
+	}
+
+	// Clear batch mode flag
+	state.batch_selecting = false
+
+	fmt.println("Selected all devices")
 }
 
 on_refresh_clicked :: proc "c" (button: GtkButton, user_data: rawptr) {
@@ -941,24 +1092,27 @@ generate_preview :: proc(state: ^App_State) {
 
 	// Generate based on effect
 	switch state.selected_effect {
-	case 0: // Static
+	case 0:
+		// Static
 		r := u8(state.color1.red * 255 * state.brightness / 100)
 		g := u8(state.color1.green * 255 * state.brightness / 100)
 		b := u8(state.color1.blue * 255 * state.brightness / 100)
 
-		for i in 0..<total_leds {
+		for i in 0 ..< total_leds {
 			state.led_colors[i] = {r, g, b}
 		}
 
-	case 1: // Rainbow
-		for i in 0..<total_leds {
+	case 1:
+		// Rainbow
+		for i in 0 ..< total_leds {
 			hue := f64(i) / f64(total_leds)
 			color := hsv_to_rgb(hue, 1.0, state.brightness / 100.0)
 			state.led_colors[i] = color
 		}
 
-	case 2: // Alternating
-		for i in 0..<total_leds {
+	case 2:
+		// Alternating
+		for i in 0 ..< total_leds {
 			if i % 2 == 0 {
 				r := u8(state.color1.red * 255 * state.brightness / 100)
 				g := u8(state.color1.green * 255 * state.brightness / 100)
@@ -972,8 +1126,9 @@ generate_preview :: proc(state: ^App_State) {
 			}
 		}
 
-	case: // Default to dim
-		for i in 0..<total_leds {
+	case:
+		// Default to dim
+		for i in 0 ..< total_leds {
 			state.led_colors[i] = {26, 26, 26}
 		}
 	}
@@ -1001,11 +1156,7 @@ hsv_to_rgb :: proc(h, s, v: f64) -> [3]u8 {
 		r, g, b = c, 0, x
 	}
 
-	return {
-		u8((r + m) * 255),
-		u8((g + m) * 255),
-		u8((b + m) * 255),
-	}
+	return {u8((r + m) * 255), u8((g + m) * 255), u8((b + m) * 255)}
 }
 
 // Poll devices from service via socket
@@ -1029,8 +1180,8 @@ poll_devices_from_service :: proc(state: ^App_State) {
 	}
 
 	// Send Get_Devices request
-	request := rl.IPC_Message{
-		type = .Get_Devices,
+	request := rl.IPC_Message {
+		type    = .Get_Devices,
 		payload = "",
 	}
 
@@ -1083,11 +1234,11 @@ poll_devices_from_service :: proc(state: ^App_State) {
 			led_count = int(cached_dev.fan_num) * 26
 		}
 
-		device := Device{
-			mac_str = cached_dev.mac_str,
-			rx_type = cached_dev.rx_type,
-			channel = cached_dev.channel,
-			bound = cached_dev.bound_to_us,
+		device := Device {
+			mac_str   = cached_dev.mac_str,
+			rx_type   = cached_dev.rx_type,
+			channel   = cached_dev.channel,
+			bound     = cached_dev.bound_to_us,
 			led_count = led_count,
 			fan_count = int(cached_dev.fan_num),
 		}
@@ -1098,8 +1249,10 @@ poll_devices_from_service :: proc(state: ^App_State) {
 	log_info("Loaded %d devices from service", len(state.devices))
 }
 
-// Send identify request to service
-send_identify_request :: proc(device: Device) {
+// Send identify requests for multiple devices to service
+send_identify_requests :: proc(devices: []Device) {
+	if len(devices) == 0 do return
+
 	// Get socket path
 	socket_path, path_err := rl.get_socket_path()
 	defer delete(socket_path)
@@ -1118,11 +1271,20 @@ send_identify_request :: proc(device: Device) {
 		return
 	}
 
-	// Build identify request
+	// Build identify request with all devices
+	device_infos := make([dynamic]rl.Identify_Device_Info, 0, len(devices))
+	defer delete(device_infos)
+
+	for device in devices {
+		append(&device_infos, rl.Identify_Device_Info{
+			mac_str = device.mac_str,
+			rx_type = device.rx_type,
+			channel = device.channel,
+		})
+	}
+
 	identify_req := rl.Identify_Request{
-		mac_str = device.mac_str,
-		rx_type = device.rx_type,
-		channel = device.channel,
+		devices = device_infos[:],
 	}
 
 	// Marshal to JSON
@@ -1145,7 +1307,12 @@ send_identify_request :: proc(device: Device) {
 		return
 	}
 
-	log_debug("Identify request sent for device %s", device.mac_str)
-	// Don't wait for response - this is fire-and-forget
+	log_debug("Identify request sent for %d device(s)", len(devices))
+}
+
+// Send identify request to service (single device convenience wrapper)
+send_identify_request :: proc(device: Device) {
+	devices := []Device{device}
+	send_identify_requests(devices)
 }
 

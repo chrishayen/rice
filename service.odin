@@ -430,44 +430,57 @@ handle_socket_message :: proc(client_fd: c.int, state: ^Service_State) {
 			log_warn("Failed to unmarshal identify request: %v", unmarshal_err)
 			return
 		}
+		defer delete(identify_req.devices)
 
-		log_info(
-			"Identifying device: %s (rx_type=%d, channel=%d)",
-			identify_req.mac_str,
-			identify_req.rx_type,
-			identify_req.channel,
-		)
+		log_info("Identifying %d device(s)", len(identify_req.devices))
 
-		// Parse MAC address
-		mac_parts := strings.split(identify_req.mac_str, ":")
-		defer delete(mac_parts)
+		// Build batch identify list
+		devices_to_identify := make([dynamic]rl.Device_Identify_Info, 0, len(identify_req.devices))
+		defer delete(devices_to_identify)
 
-		if len(mac_parts) != 6 {
-			log_warn("Invalid MAC address format: %s", identify_req.mac_str)
-			return
-		}
+		for device_info in identify_req.devices {
+			log_info(
+				"Identifying device: %s (rx_type=%d, channel=%d)",
+				device_info.mac_str,
+				device_info.rx_type,
+				device_info.channel,
+			)
 
-		device_mac: [6]u8
-		for part, i in mac_parts {
-			val, ok := strconv.parse_u64_of_base(part, 16)
-			if !ok {
-				log_warn("Invalid MAC address byte: %s", part)
-				return
+			// Parse MAC address
+			mac_parts := strings.split(device_info.mac_str, ":")
+			defer delete(mac_parts)
+
+			if len(mac_parts) != 6 {
+				log_warn("Invalid MAC address format: %s", device_info.mac_str)
+				continue
 			}
-			device_mac[i] = u8(val)
+
+			device_mac: [6]u8
+			for part, i in mac_parts {
+				val, ok := strconv.parse_u64_of_base(part, 16)
+				if !ok {
+					log_warn("Invalid MAC address byte: %s", part)
+					continue
+				}
+				device_mac[i] = u8(val)
+			}
+
+			append(&devices_to_identify, rl.Device_Identify_Info{
+				device_mac = device_mac,
+				rx_type = device_info.rx_type,
+				channel = device_info.channel,
+			})
 		}
 
-		// Call identify_device from LED library (fire-and-forget)
-		identify_err := rl.identify_device(
-			&state.led_device,
-			device_mac,
-			identify_req.rx_type,
-			identify_req.channel,
-		)
-		if identify_err != .None {
-			log_warn("Failed to identify device: %v", identify_err)
-		} else {
-			log_debug("Device identify command sent")
+		// Identify all devices simultaneously using batch method
+		if len(devices_to_identify) > 0 {
+			log_info("Identifying %d devices simultaneously...", len(devices_to_identify))
+			identify_err := rl.identify_devices_batch(&state.led_device, devices_to_identify[:])
+			if identify_err != .None {
+				log_warn("Failed to identify devices: %v", identify_err)
+			} else {
+				log_info("All devices identified successfully")
+			}
 		}
 
 		// No response - this is fire-and-forget

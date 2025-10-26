@@ -44,6 +44,10 @@ Effect_Request :: struct {
 }
 
 Identify_Request :: struct {
+	devices: []Identify_Device_Info,
+}
+
+Identify_Device_Info :: struct {
 	mac_str: string,
 	rx_type: u8,
 	channel: u8,
