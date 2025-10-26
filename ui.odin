@@ -614,6 +614,8 @@ build_led_effects_page :: proc(state: ^App_State) -> GtkWidget {
 	// Left: preview
 	preview := build_preview_panel(state)
 	gtk_paned_set_start_child(auto_cast paned, preview)
+	gtk_paned_set_resize_start_child(auto_cast paned, true)
+	gtk_paned_set_shrink_start_child(auto_cast paned, true)
 
 	// Right: controls
 	controls := build_effect_controls(state)
@@ -621,7 +623,7 @@ build_led_effects_page :: proc(state: ^App_State) -> GtkWidget {
 	gtk_paned_set_resize_end_child(auto_cast paned, false)
 	gtk_paned_set_shrink_end_child(auto_cast paned, false)
 
-	gtk_paned_set_position(auto_cast paned, 800)
+	gtk_paned_set_position(auto_cast paned, 400)
 
 	return paned
 }
@@ -755,8 +757,8 @@ build_preview_panel :: proc(state: ^App_State) -> GtkWidget {
 
 	// Drawing area
 	state.preview_area = auto_cast gtk_drawing_area_new()
-	gtk_drawing_area_set_content_width(state.preview_area, 600)
-	gtk_drawing_area_set_content_height(state.preview_area, 400)
+	gtk_drawing_area_set_content_width(state.preview_area, 300)
+	gtk_drawing_area_set_content_height(state.preview_area, 300)
 	gtk_drawing_area_set_draw_func(state.preview_area, draw_preview, state, nil)
 	gtk_frame_set_child(auto_cast frame, auto_cast state.preview_area)
 
