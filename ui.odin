@@ -10,7 +10,6 @@ import "core:encoding/json"
 import "core:fmt"
 import "core:math"
 import "core:strings"
-import rl "ricelib"
 
 // GTK4 + libadwaita bindings
 foreign import gtk "system:gtk-4"
@@ -145,6 +144,12 @@ foreign gtk {
 	gtk_widget_set_size_request :: proc(widget: GtkWidget, width, height: c.int) ---
 	gtk_widget_queue_draw :: proc(widget: GtkWidget) ---
 	gtk_widget_add_css_class :: proc(widget: GtkWidget, css_class: cstring) ---
+	gtk_widget_get_first_child :: proc(widget: GtkWidget) -> GtkWidget ---
+	gtk_widget_get_next_sibling :: proc(widget: GtkWidget) -> GtkWidget ---
+
+	gtk_button_set_child :: proc(button: GtkButton, child: GtkWidget) ---
+
+	gtk_box_remove :: proc(box: GtkBox, child: GtkWidget) ---
 
 	gtk_window_set_default_size :: proc(window: GtkWindow, width, height: c.int) ---
 	gtk_native_get_surface :: proc(native: rawptr) -> GdkSurface ---
@@ -228,6 +233,11 @@ foreign cairo {
 	cairo_set_font_size :: proc(cr: cairo_t, size: c.double) ---
 	cairo_show_text :: proc(cr: cairo_t, text: cstring) ---
 	cairo_text_extents :: proc(cr: cairo_t, text: cstring, extents: ^cairo_text_extents_t) ---
+	cairo_save :: proc(cr: cairo_t) ---
+	cairo_restore :: proc(cr: cairo_t) ---
+	cairo_translate :: proc(cr: cairo_t, tx, ty: c.double) ---
+	cairo_rotate :: proc(cr: cairo_t, angle: c.double) ---
+	cairo_scale :: proc(cr: cairo_t, sx, sy: c.double) ---
 }
 
 cairo_text_extents_t :: struct {
@@ -266,12 +276,15 @@ App_State :: struct {
 }
 
 Device :: struct {
-	mac_str:   string,
-	rx_type:   u8,
-	channel:   u8,
-	bound:     bool,
-	led_count: int,
-	fan_count: int,
+	mac_str:       string,
+	rx_type:       u8,
+	channel:       u8,
+	bound:         bool,
+	led_count:     int,
+	fan_count:     int,
+	dev_type_name: string,
+	fan_types:     [4]u8,
+	has_lcd:       bool,
 }
 
 Effect_Info :: struct {
@@ -394,187 +407,6 @@ on_activate :: proc "c" (app: AdwApplication, user_data: rawptr) {
 
 	// Schedule initial device poll after UI is shown (500ms delay to avoid blocking startup)
 	g_timeout_add(500, auto_cast on_initial_poll, state)
-}
-
-// Initial device poll timeout callback
-on_initial_poll :: proc "c" (user_data: rawptr) -> c.bool {
-	context = runtime.default_context()
-	state := cast(^App_State)user_data
-
-	// Poll devices from service
-	poll_devices_from_service(state)
-
-	// Rebuild device list
-	rebuild_device_list(state)
-
-	// Return false to run only once
-	return false
-}
-
-build_device_panel :: proc(state: ^App_State) -> GtkWidget {
-	box := auto_cast gtk_box_new(.VERTICAL, 12)
-	gtk_widget_set_margin_start(box, 12)
-	gtk_widget_set_margin_end(box, 12)
-	gtk_widget_set_margin_top(box, 12)
-	gtk_widget_set_margin_bottom(box, 12)
-
-	// Header with title and select all button
-	header_box := auto_cast gtk_box_new(.HORIZONTAL, 12)
-	gtk_box_append(auto_cast box, header_box)
-
-	// Title
-	title := auto_cast gtk_label_new("Devices")
-	gtk_label_set_markup(auto_cast title, "<span size='14000' weight='bold'>Devices</span>")
-	gtk_label_set_xalign(auto_cast title, 0.0)
-	gtk_widget_set_hexpand(title, true)
-	gtk_box_append(auto_cast header_box, title)
-
-	// Select All button
-	select_all_btn := auto_cast gtk_button_new_with_label("Select All")
-	gtk_widget_add_css_class(select_all_btn, "flat")
-	g_signal_connect_data(
-		select_all_btn,
-		"clicked",
-		auto_cast on_select_all_clicked,
-		state,
-		nil,
-		0,
-	)
-	gtk_box_append(auto_cast header_box, select_all_btn)
-
-	// Scrolled window for devices
-	scrolled := auto_cast gtk_scrolled_window_new()
-	gtk_scrolled_window_set_policy(auto_cast scrolled, .NEVER, .AUTOMATIC)
-	gtk_widget_set_vexpand(scrolled, true)
-	gtk_box_append(auto_cast box, scrolled)
-
-	// Device list
-	device_list := auto_cast gtk_box_new(.VERTICAL, 6)
-	gtk_scrolled_window_set_child(auto_cast scrolled, device_list)
-
-	// Store reference to device list for later updates
-	state.device_list_box = auto_cast device_list
-
-	// Add device cards
-	rebuild_device_list(state)
-
-	return box
-}
-
-// Rebuild device list from current state.devices
-rebuild_device_list :: proc(state: ^App_State) {
-	if state.device_list_box == nil {
-		return
-	}
-
-	// Clear existing children
-	foreign gtk {
-		gtk_widget_get_first_child :: proc(widget: GtkWidget) -> GtkWidget ---
-		gtk_widget_get_next_sibling :: proc(widget: GtkWidget) -> GtkWidget ---
-		gtk_box_remove :: proc(box: GtkBox, child: GtkWidget) ---
-	}
-
-	// Remove all children
-	child := gtk_widget_get_first_child(auto_cast state.device_list_box)
-	for child != nil {
-		next_child := gtk_widget_get_next_sibling(child)
-		gtk_box_remove(state.device_list_box, child)
-		child = next_child
-	}
-
-	// Clear toggle buttons and selection arrays
-	clear(&state.device_toggle_buttons)
-	clear(&state.selected_devices)
-
-	// Add new device cards
-	device_idx := 0
-	for device in state.devices {
-		if device.rx_type == 255 do continue
-
-		card := build_device_card(device, state, device_idx)
-		gtk_box_append(state.device_list_box, card)
-
-		append(&state.selected_devices, false)
-		device_idx += 1
-	}
-}
-
-build_device_card :: proc(device: Device, state: ^App_State, device_idx: int) -> GtkWidget {
-	// Create a toggle button so the device card is selectable
-	foreign gtk {
-		gtk_button_set_child :: proc(button: GtkButton, child: GtkWidget) ---
-	}
-
-	button := auto_cast gtk_toggle_button_new()
-	gtk_widget_add_css_class(button, "card")
-	gtk_widget_set_margin_top(button, 3)
-	gtk_widget_set_margin_bottom(button, 3)
-
-	// Store the toggle button
-	append(&state.device_toggle_buttons, auto_cast button)
-
-	// Connect toggle handler
-	toggle_data := new(int)
-	toggle_data^ = device_idx
-	g_signal_connect_data(button, "toggled", auto_cast on_device_toggled, toggle_data, nil, 0)
-
-	box := auto_cast gtk_box_new(.VERTICAL, 6)
-	gtk_widget_set_margin_start(box, 12)
-	gtk_widget_set_margin_end(box, 12)
-	gtk_widget_set_margin_top(box, 12)
-	gtk_widget_set_margin_bottom(box, 12)
-	gtk_button_set_child(auto_cast button, box)
-
-	// MAC address
-	mac_cstr := strings.clone_to_cstring(device.mac_str)
-	defer delete(mac_cstr)
-	mac_label := auto_cast gtk_label_new(mac_cstr)
-	gtk_label_set_markup(
-		auto_cast mac_label,
-		fmt.ctprintf("<span weight='bold' size='12000'>%s</span>", mac_cstr),
-	)
-	gtk_label_set_xalign(auto_cast mac_label, 0.0)
-	gtk_box_append(auto_cast box, mac_label)
-
-	// Type info
-	type_name: cstring
-	switch device.rx_type {
-	case 1:
-		type_name = "SL-LCD"
-	case 2:
-		type_name = "TL"
-	case 3:
-		type_name = "TL3"
-	case:
-		type_name = "Unknown"
-	}
-
-	info_label := auto_cast gtk_label_new(
-		fmt.ctprintf("%s • Channel %d", type_name, device.channel),
-	)
-	gtk_label_set_markup(
-		auto_cast info_label,
-		fmt.ctprintf("<span size='10000'>%s • Channel %d</span>", type_name, device.channel),
-	)
-	gtk_label_set_xalign(auto_cast info_label, 0.0)
-	gtk_box_append(auto_cast box, info_label)
-
-	// Status
-	status_color := device.bound ? "success" : "warning"
-	status_text: cstring = device.bound ? "Bound" : "Unbound"
-	status_label := auto_cast gtk_label_new(status_text)
-	gtk_label_set_markup(
-		auto_cast status_label,
-		fmt.ctprintf(
-			"<span size='10000' foreground='%s'>%s</span>",
-			device.bound ? "#26a269" : "#e5a50a",
-			status_text,
-		),
-	)
-	gtk_label_set_xalign(auto_cast status_label, 0.0)
-	gtk_box_append(auto_cast box, status_label)
-
-	return button
 }
 
 build_tabs :: proc(state: ^App_State) -> GtkWidget {
@@ -864,14 +696,17 @@ draw_preview :: proc "c" (
 
 			leds_per_fan := device.led_count / device.fan_count
 
-			draw_fan_hexagon(
+			// Get the fan type for this specific fan
+			fan_type := device.fan_types[fan]
+
+			draw_fan_circle(
 				cr,
 				center_x,
 				center_y,
 				leds_per_fan,
 				led_offset,
 				state,
-				device.rx_type,
+				fan_type,
 			)
 
 			led_offset += leds_per_fan
@@ -880,99 +715,229 @@ draw_preview :: proc "c" (
 	}
 }
 
-draw_fan_hexagon :: proc(
+draw_fan_circle :: proc(
 	cr: cairo_t,
 	center_x, center_y: f64,
 	num_leds, led_offset: int,
 	state: ^App_State,
-	rx_type: u8,
+	fan_type: u8,
 ) {
-	FAN_RADIUS :: 60.0
+	FAN_SIZE :: 70.0 // Size of the fan visualization
+	FAN_INNER_RADIUS :: 18.0
 	LED_RADIUS :: 4.0
 
-	// Draw hexagon outline
-	for i in 0 ..< 6 {
-		angle1 := f64(i) / 6.0 * 2.0 * math.PI - math.PI / 2.0
-		angle2 := f64(i + 1) / 6.0 * 2.0 * math.PI - math.PI / 2.0
+	// Determine if this is an SL or TL fan
+	is_sl := fan_type >= 20 && fan_type <= 26
+	is_tl := fan_type == 28
 
-		x1 := center_x + FAN_RADIUS * math.cos(angle1)
-		y1 := center_y + FAN_RADIUS * math.sin(angle1)
-		x2 := center_x + FAN_RADIUS * math.cos(angle2)
-		y2 := center_y + FAN_RADIUS * math.sin(angle2)
+	if is_sl {
+		// Draw SL 120 fan with square frame
+		FRAME_SIZE :: FAN_SIZE
 
-		cairo_move_to(cr, x1, y1)
-		cairo_line_to(cr, x2, y2)
-	}
+		// Draw filled square background (dark grey)
+		half := FRAME_SIZE / 2
+		cairo_set_source_rgba(cr, 0.15, 0.15, 0.15, 1.0)
+		cairo_move_to(cr, center_x - half, center_y - half)
+		cairo_line_to(cr, center_x + half, center_y - half)
+		cairo_line_to(cr, center_x + half, center_y + half)
+		cairo_line_to(cr, center_x - half, center_y + half)
+		cairo_close_path(cr)
+		cairo_fill(cr)
 
-	cairo_set_source_rgba(cr, 0.3, 0.3, 0.3, 0.5)
-	cairo_set_line_width(cr, 2)
-	cairo_stroke(cr)
+		// Draw center circle for fan motor (dark)
+		FAN_CENTER_RADIUS :: 25.0
+		cairo_set_source_rgba(cr, 0.2, 0.2, 0.2, 1.0)
+		cairo_arc(cr, center_x, center_y, FAN_CENTER_RADIUS, 0, 2 * math.PI)
+		cairo_fill(cr)
 
-	// Draw LEDs
-	leds_per_edge := f64(num_leds) / 6.0
+		// Draw center circle border
+		cairo_set_source_rgba(cr, 0.3, 0.3, 0.3, 1.0)
+		cairo_set_line_width(cr, 1.0)
+		cairo_arc(cr, center_x, center_y, FAN_CENTER_RADIUS, 0, 2 * math.PI)
+		cairo_stroke(cr)
 
-	for edge in 0 ..< 6 {
-		angle1 := f64(edge) / 6.0 * 2.0 * math.PI - math.PI / 2.0
-		angle2 := f64(edge + 1) / 6.0 * 2.0 * math.PI - math.PI / 2.0
+		// Draw LEDs using layout
+		if num_leds == SL_120_LED_COUNT {
+			layout := generate_sl_120_layout()
 
-		p1x := center_x + FAN_RADIUS * math.cos(angle1)
-		p1y := center_y + FAN_RADIUS * math.sin(angle1)
-		p2x := center_x + FAN_RADIUS * math.cos(angle2)
-		p2y := center_y + FAN_RADIUS * math.sin(angle2)
+			for i in 0 ..< num_leds {
+				pos := layout[i]
+				led_x := center_x + pos.x * FAN_SIZE
+				led_y := center_y + pos.y * FAN_SIZE
 
-		edge_start_led := int(f64(edge) * leds_per_edge)
-		edge_end_led := int(f64(edge + 1) * leds_per_edge)
-		edge_led_count := edge_end_led - edge_start_led
+				// Get LED color
+				color_idx := led_offset + i
+				r, g, b: f64 = 0.05, 0.05, 0.05
 
-		for i in 0 ..< edge_led_count {
-			t := (f64(i) + 0.5) / f64(edge_led_count)
+				if color_idx >= 0 && color_idx < len(state.led_colors) {
+					r = f64(state.led_colors[color_idx].r) / 255.0
+					g = f64(state.led_colors[color_idx].g) / 255.0
+					b = f64(state.led_colors[color_idx].b) / 255.0
+				}
 
-			led_x := p1x + t * (p2x - p1x)
-			led_y := p1y + t * (p2y - p1y)
+				// Calculate angle for LED strip orientation
+				// Use the angle stored in the LED position
+				led_angle := pos.angle
 
-			led_idx := edge_start_led + i
-			if led_idx >= num_leds do break
+				// LED bar dimensions - make them larger to look like strips
+				BAR_LENGTH :: 12.0
+				BAR_WIDTH :: 4.0
 
-			// Get LED color
-			color_idx := led_offset + led_idx
-			r, g, b: f64 = 0.1, 0.1, 0.1
+				// Draw LED glow (larger ellipse)
+				if r > 0.1 || g > 0.1 || b > 0.1 {
+					cairo_save(cr)
+					cairo_translate(cr, led_x, led_y)
+					cairo_rotate(cr, led_angle - math.PI / 2)
 
-			if color_idx >= 0 && color_idx < len(state.led_colors) {
-				r = f64(state.led_colors[color_idx].r) / 255.0
-				g = f64(state.led_colors[color_idx].g) / 255.0
-				b = f64(state.led_colors[color_idx].b) / 255.0
+					// Glow ellipse
+					cairo_set_source_rgba(cr, r, g, b, 0.4)
+					cairo_scale(cr, BAR_LENGTH * 1.5, BAR_WIDTH * 2.0)
+					cairo_arc(cr, 0, 0, 1, 0, 2 * math.PI)
+					cairo_fill(cr)
+
+					cairo_restore(cr)
+				}
+
+				// Draw LED bar core
+				cairo_save(cr)
+				cairo_translate(cr, led_x, led_y)
+				cairo_rotate(cr, led_angle - math.PI / 2)
+
+				cairo_set_source_rgb(cr, r, g, b)
+				// Draw rounded rectangle
+				half_len := BAR_LENGTH / 2
+				half_width := BAR_WIDTH / 2
+				cairo_move_to(cr, -half_len, -half_width)
+				cairo_line_to(cr, half_len, -half_width)
+				cairo_line_to(cr, half_len, half_width)
+				cairo_line_to(cr, -half_len, half_width)
+				cairo_close_path(cr)
+				cairo_fill(cr)
+
+				cairo_restore(cr)
 			}
+		}
 
-			// Draw LED
-			cairo_set_source_rgb(cr, r, g, b)
-			cairo_arc(cr, led_x, led_y, LED_RADIUS, 0, 2 * math.PI)
-			cairo_fill(cr)
+	} else if is_tl {
+		// Draw TL fan with simple circle
+		FAN_OUTER_RADIUS :: FAN_SIZE
 
-			// Draw glow
-			if r > 0.1 || g > 0.1 || b > 0.1 {
-				cairo_set_source_rgba(cr, r, g, b, 0.3)
-				cairo_arc(cr, led_x, led_y, LED_RADIUS * 2, 0, 2 * math.PI)
+		// Draw outer circle
+		cairo_set_source_rgba(cr, 0.25, 0.25, 0.25, 0.8)
+		cairo_arc(cr, center_x, center_y, FAN_OUTER_RADIUS, 0, 2 * math.PI)
+		cairo_fill(cr)
+
+		// Draw inner circle
+		cairo_set_source_rgba(cr, 0.15, 0.15, 0.15, 0.9)
+		cairo_arc(cr, center_x, center_y, FAN_INNER_RADIUS, 0, 2 * math.PI)
+		cairo_fill(cr)
+
+		// Draw fan blades
+		BLADE_COUNT :: 9
+		cairo_set_source_rgba(cr, 0.2, 0.2, 0.2, 0.6)
+		cairo_set_line_width(cr, 3)
+		for i in 0 ..< BLADE_COUNT {
+			angle := f64(i) / f64(BLADE_COUNT) * 2.0 * math.PI
+			x1 := center_x + FAN_INNER_RADIUS * math.cos(angle)
+			y1 := center_y + FAN_INNER_RADIUS * math.sin(angle)
+			x2 := center_x + (FAN_OUTER_RADIUS - 8) * math.cos(angle + 0.15)
+			y2 := center_y + (FAN_OUTER_RADIUS - 8) * math.sin(angle + 0.15)
+			cairo_move_to(cr, x1, y1)
+			cairo_line_to(cr, x2, y2)
+			cairo_stroke(cr)
+		}
+
+		// Draw LEDs using layout
+		if num_leds == TL_LED_COUNT {
+			layout := generate_tl_layout()
+
+			for i in 0 ..< num_leds {
+				pos := layout[i]
+				led_x := center_x + pos.x * FAN_SIZE
+				led_y := center_y + pos.y * FAN_SIZE
+
+				// Get LED color
+				color_idx := led_offset + i
+				r, g, b: f64 = 0.1, 0.1, 0.1
+
+				if color_idx >= 0 && color_idx < len(state.led_colors) {
+					r = f64(state.led_colors[color_idx].r) / 255.0
+					g = f64(state.led_colors[color_idx].g) / 255.0
+					b = f64(state.led_colors[color_idx].b) / 255.0
+				}
+
+				// Draw LED glow
+				if r > 0.1 || g > 0.1 || b > 0.1 {
+					cairo_set_source_rgba(cr, r, g, b, 0.4)
+					cairo_arc(cr, led_x, led_y, LED_RADIUS * 2.5, 0, 2 * math.PI)
+					cairo_fill(cr)
+				}
+
+				// Draw LED core
+				cairo_set_source_rgb(cr, r, g, b)
+				cairo_arc(cr, led_x, led_y, LED_RADIUS, 0, 2 * math.PI)
+				cairo_fill(cr)
+			}
+		}
+	} else {
+		// Fallback: generic circle for unknown types
+		FAN_OUTER_RADIUS :: FAN_SIZE
+		LED_RING_RADIUS :: FAN_SIZE * 0.85
+
+		// Draw outer circle
+		cairo_set_source_rgba(cr, 0.25, 0.25, 0.25, 0.8)
+		cairo_arc(cr, center_x, center_y, FAN_OUTER_RADIUS, 0, 2 * math.PI)
+		cairo_fill(cr)
+
+		// Draw inner circle
+		cairo_set_source_rgba(cr, 0.15, 0.15, 0.15, 0.9)
+		cairo_arc(cr, center_x, center_y, FAN_INNER_RADIUS, 0, 2 * math.PI)
+		cairo_fill(cr)
+
+		// Draw LEDs in a circle
+		if num_leds > 0 {
+			for i in 0 ..< num_leds {
+				angle := f64(i) / f64(num_leds) * 2.0 * math.PI - math.PI / 2.0
+				led_x := center_x + LED_RING_RADIUS * math.cos(angle)
+				led_y := center_y + LED_RING_RADIUS * math.sin(angle)
+
+				color_idx := led_offset + i
+				r, g, b: f64 = 0.1, 0.1, 0.1
+
+				if color_idx >= 0 && color_idx < len(state.led_colors) {
+					r = f64(state.led_colors[color_idx].r) / 255.0
+					g = f64(state.led_colors[color_idx].g) / 255.0
+					b = f64(state.led_colors[color_idx].b) / 255.0
+				}
+
+				if r > 0.1 || g > 0.1 || b > 0.1 {
+					cairo_set_source_rgba(cr, r, g, b, 0.4)
+					cairo_arc(cr, led_x, led_y, LED_RADIUS * 2.5, 0, 2 * math.PI)
+					cairo_fill(cr)
+				}
+
+				cairo_set_source_rgb(cr, r, g, b)
+				cairo_arc(cr, led_x, led_y, LED_RADIUS, 0, 2 * math.PI)
 				cairo_fill(cr)
 			}
 		}
 	}
 
-	// Draw label
+	// Draw label based on fan_type
 	type_label: cstring
-	switch rx_type {
-	case 1:
+	if fan_type >= 20 && fan_type <= 26 {
 		type_label = "SL"
-	case 2:
+	} else if fan_type == 28 {
 		type_label = "TL"
-	case 3:
-		type_label = "TL3"
-	case:
+	} else if fan_type == 65 {
+		type_label = "LCD"
+	} else {
 		type_label = "?"
 	}
 
 	cairo_set_source_rgb(cr, 0.7, 0.7, 0.7)
-	cairo_select_font_face(cr, "Inter", 0, 1) // BOLD - Inter font for modern look
-	cairo_set_font_size(cr, 12)
+	cairo_select_font_face(cr, "Inter", 0, 1)
+	cairo_set_font_size(cr, 11)
 
 	extents: cairo_text_extents_t
 	cairo_text_extents(cr, type_label, &extents)
@@ -981,64 +946,6 @@ draw_fan_hexagon :: proc(
 }
 
 // Callbacks
-on_device_toggled :: proc "c" (button: GtkToggleButton, user_data: rawptr) {
-	context = runtime.default_context()
-	state := global_state
-	if state == nil do return
-
-	device_idx := cast(^int)user_data
-	if device_idx^ >= 0 && device_idx^ < len(state.selected_devices) {
-		is_active := gtk_toggle_button_get_active(button)
-		state.selected_devices[device_idx^] = bool(is_active)
-
-		if is_active {
-			fmt.printfln("Selected device %d", device_idx^)
-
-			// Only send identify if not in batch mode
-			if !state.batch_selecting && device_idx^ < len(state.devices) {
-				device := state.devices[device_idx^]
-				fmt.printfln("Identifying device: %s", device.mac_str)
-				send_identify_request(device)
-			}
-		} else {
-			fmt.printfln("Deselected device %d", device_idx^)
-		}
-	}
-}
-
-on_select_all_clicked :: proc "c" (button: GtkButton, user_data: rawptr) {
-	context = runtime.default_context()
-	state := cast(^App_State)user_data
-
-	// Set batch mode flag to prevent individual identify calls
-	state.batch_selecting = true
-
-	// Build list of valid devices to identify
-	devices_to_identify := make([dynamic]Device, 0, len(state.devices))
-	defer delete(devices_to_identify)
-
-	for device in state.devices {
-		if device.rx_type == 255 do continue
-		append(&devices_to_identify, device)
-	}
-
-	// Send identify requests for all devices at once (single IPC call)
-	if len(devices_to_identify) > 0 {
-		fmt.printfln("Identifying %d device(s)", len(devices_to_identify))
-		send_identify_requests(devices_to_identify[:])
-	}
-
-	// Then toggle all devices on
-	for toggle_btn in state.device_toggle_buttons {
-		gtk_toggle_button_set_active(toggle_btn, true)
-	}
-
-	// Clear batch mode flag
-	state.batch_selecting = false
-
-	fmt.println("Selected all devices")
-}
-
 on_refresh_clicked :: proc "c" (button: GtkButton, user_data: rawptr) {
 	context = runtime.default_context()
 	state := cast(^App_State)user_data
@@ -1107,9 +1014,9 @@ generate_preview :: proc(state: ^App_State) {
 	case 1:
 		// Rainbow
 		for i in 0 ..< total_leds {
-			hue := f64(i) / f64(total_leds)
-			color := hsv_to_rgb(hue, 1.0, state.brightness / 100.0)
-			state.led_colors[i] = color
+			hue := f32(i) / f32(total_leds)
+			r, g, b := hsv_to_rgb(hue, 1.0, f32(state.brightness / 100.0))
+			state.led_colors[i] = {r, g, b}
 		}
 
 	case 2:
@@ -1136,185 +1043,4 @@ generate_preview :: proc(state: ^App_State) {
 	}
 }
 
-hsv_to_rgb :: proc(h, s, v: f64) -> [3]u8 {
-	c := v * s
-	x := c * (1.0 - abs(math.mod(h * 6.0, 2.0) - 1.0))
-	m := v - c
-
-	r, g, b: f64
-
-	h6 := h * 6.0
-	if h6 < 1.0 {
-		r, g, b = c, x, 0
-	} else if h6 < 2.0 {
-		r, g, b = x, c, 0
-	} else if h6 < 3.0 {
-		r, g, b = 0, c, x
-	} else if h6 < 4.0 {
-		r, g, b = 0, x, c
-	} else if h6 < 5.0 {
-		r, g, b = x, 0, c
-	} else {
-		r, g, b = c, 0, x
-	}
-
-	return {u8((r + m) * 255), u8((g + m) * 255), u8((b + m) * 255)}
-}
-
-// Poll devices from service via socket
-poll_devices_from_service :: proc(state: ^App_State) {
-	// Get socket path
-	socket_path, path_err := rl.get_socket_path()
-	defer delete(socket_path)
-
-	if path_err != .None {
-		log_warn("Failed to get socket path: %v", path_err)
-		return
-	}
-
-	// Connect to service (reconnect each time since service closes after each request)
-	client, connect_err := rl.connect_to_server(socket_path)
-	defer rl.close_client(&client)
-
-	if connect_err != .None {
-		log_warn("Failed to connect to service: %v (is service running?)", connect_err)
-		return
-	}
-
-	// Send Get_Devices request
-	request := rl.IPC_Message {
-		type    = .Get_Devices,
-		payload = "",
-	}
-
-	send_err := rl.send_message(client.socket_fd, request)
-	if send_err != .None {
-		log_warn("Failed to send Get_Devices request: %v", send_err)
-		return
-	}
-
-	// Receive response
-	response, recv_err := rl.receive_message(client.socket_fd)
-	if recv_err != .None {
-		log_warn("Failed to receive devices response: %v", recv_err)
-		return
-	}
-	defer delete(response.payload)
-
-	if response.type != .Devices_Response {
-		log_warn("Unexpected response type: %v", response.type)
-		return
-	}
-
-	// Parse JSON response
-	// Convert string payload to byte slice
-	payload_bytes := transmute([]u8)response.payload
-
-	log_debug("Received payload (%d bytes): %s", len(payload_bytes), response.payload)
-
-	cached_devices: []rl.Device_Cache_Entry
-	unmarshal_err := json.unmarshal(payload_bytes, &cached_devices)
-	if unmarshal_err != nil {
-		log_warn("Failed to unmarshal devices: %v", unmarshal_err)
-		log_debug("Payload was: %s", response.payload)
-		return
-	}
-	defer delete(cached_devices)
-
-	// Convert to UI Device format
-	delete(state.devices)
-	state.devices = make([dynamic]Device)
-
-	for cached_dev in cached_devices {
-		// Calculate LED count based on fan type
-		led_count := 0
-		if cached_dev.rx_type == 1 {
-			// SL fans: 40 LEDs per fan
-			led_count = int(cached_dev.fan_num) * 40
-		} else if cached_dev.rx_type == 2 || cached_dev.rx_type == 3 {
-			// TL fans: 26 LEDs per fan
-			led_count = int(cached_dev.fan_num) * 26
-		}
-
-		device := Device {
-			mac_str   = cached_dev.mac_str,
-			rx_type   = cached_dev.rx_type,
-			channel   = cached_dev.channel,
-			bound     = cached_dev.bound_to_us,
-			led_count = led_count,
-			fan_count = int(cached_dev.fan_num),
-		}
-
-		append(&state.devices, device)
-	}
-
-	log_info("Loaded %d devices from service", len(state.devices))
-}
-
-// Send identify requests for multiple devices to service
-send_identify_requests :: proc(devices: []Device) {
-	if len(devices) == 0 do return
-
-	// Get socket path
-	socket_path, path_err := rl.get_socket_path()
-	defer delete(socket_path)
-
-	if path_err != .None {
-		log_warn("Failed to get socket path: %v", path_err)
-		return
-	}
-
-	// Connect to service
-	client, connect_err := rl.connect_to_server(socket_path)
-	defer rl.close_client(&client)
-
-	if connect_err != .None {
-		log_warn("Failed to connect to service: %v (is service running?)", connect_err)
-		return
-	}
-
-	// Build identify request with all devices
-	device_infos := make([dynamic]rl.Identify_Device_Info, 0, len(devices))
-	defer delete(device_infos)
-
-	for device in devices {
-		append(&device_infos, rl.Identify_Device_Info{
-			mac_str = device.mac_str,
-			rx_type = device.rx_type,
-			channel = device.channel,
-		})
-	}
-
-	identify_req := rl.Identify_Request{
-		devices = device_infos[:],
-	}
-
-	// Marshal to JSON
-	json_data, marshal_err := json.marshal(identify_req)
-	if marshal_err != nil {
-		log_warn("Failed to marshal identify request: %v", marshal_err)
-		return
-	}
-	defer delete(json_data)
-
-	// Send Identify_Device request
-	request := rl.IPC_Message{
-		type = .Identify_Device,
-		payload = string(json_data),
-	}
-
-	send_err := rl.send_message(client.socket_fd, request)
-	if send_err != .None {
-		log_warn("Failed to send Identify_Device request: %v", send_err)
-		return
-	}
-
-	log_debug("Identify request sent for %d device(s)", len(devices))
-}
-
-// Send identify request to service (single device convenience wrapper)
-send_identify_request :: proc(device: Device) {
-	devices := []Device{device}
-	send_identify_requests(devices)
-}
 
