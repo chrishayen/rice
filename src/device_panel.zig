@@ -72,7 +72,7 @@ fn onSelectAllClicked(button: *gtk.GtkButton, user_data: ?*anyopaque) callconv(.
     _ = button;
     const app_state = @as(*ui.AppState, @ptrCast(@alignCast(user_data.?)));
 
-    // Toggle all devices
+    // Check if all devices are currently selected
     const all_selected = blk: {
         for (app_state.selected_devices.items) |selected| {
             if (!selected) break :blk false;
@@ -80,12 +80,18 @@ fn onSelectAllClicked(button: *gtk.GtkButton, user_data: ?*anyopaque) callconv(.
         break :blk true;
     };
 
-    // Set all to opposite of current state
-    for (app_state.selected_devices.items) |*selected| {
-        selected.* = !all_selected;
+    const new_state = !all_selected;
+
+    // Update all toggle buttons
+    for (app_state.device_toggle_buttons.items, 0..) |maybe_btn, i| {
+        if (maybe_btn) |btn| {
+            c.gtk_toggle_button_set_active(@ptrCast(btn), if (new_state) 1 else 0);
+        }
+        // Update internal state (in case button doesn't exist)
+        if (i < app_state.selected_devices.items.len) {
+            app_state.selected_devices.items[i] = new_state;
+        }
     }
 
-    // Update UI - would need to refresh device cards here
-    // For now, just print status
-    std.debug.print("Select all toggled: all_selected={}\n", .{!all_selected});
+    std.debug.print("Select all toggled: new_state={}\n", .{new_state});
 }

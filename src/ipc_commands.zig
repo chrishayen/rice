@@ -32,7 +32,12 @@ pub const DeviceInfo = struct {
     led_count: i32,
 };
 
+pub const EffectDeviceInfo = struct {
+    mac_str: []const u8,
+};
+
 pub const EffectRequest = struct {
+    devices: []const EffectDeviceInfo,
     effect_name: []const u8,
     color1: [3]u8,
     color2: [3]u8,

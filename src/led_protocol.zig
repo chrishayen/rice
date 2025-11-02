@@ -118,7 +118,8 @@ pub fn buildLedEffectPackets(
 ) ![][types.RF_PACKET_SIZE]u8 {
     // Generate timestamp for effect_index if not provided
     const effect_idx = effect_index orelse blk: {
-        const timestamp: u32 = @intCast(std.time.milliTimestamp());
+        const timestamp_i64 = std.time.milliTimestamp();
+        const timestamp: u32 = @truncate(@as(u64, @bitCast(timestamp_i64)));
         break :blk [4]u8{
             @intCast((timestamp >> 24) & 0xFF),
             @intCast((timestamp >> 16) & 0xFF),

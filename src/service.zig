@@ -6,7 +6,7 @@ const ipc_commands = @import("ipc_commands.zig");
 const device_cache = @import("device_cache.zig");
 
 const ServiceState = struct {
-    led_device: led.LedDevice,
+    led_device: ?led.LedDevice,
     socket_server: ipc.SocketServer,
     running: std.atomic.Value(bool),
     poll_interval_seconds: u32,
@@ -19,7 +19,7 @@ const ServiceState = struct {
 
     fn init(allocator: std.mem.Allocator) ServiceState {
         return ServiceState{
-            .led_device = undefined,
+            .led_device = null,
             .socket_server = undefined,
             .running = std.atomic.Value(bool).init(true),
             .poll_interval_seconds = 10,
@@ -53,13 +53,15 @@ pub fn runService(allocator: std.mem.Allocator) !void {
     var state = ServiceState.init(allocator);
     defer state.devices_cache.deinit(allocator);
 
-    // Initialize LED device
-    state.led_device = led.initLedDevice(allocator) catch |err| {
-        std.log.err("Failed to initialize LED device: {}", .{err});
-        std.log.err("Make sure USB devices are connected and you have proper permissions", .{});
-        return err;
-    };
-    defer led.cleanupLedDevice(&state.led_device);
+    // Initialize LED device (optional - service continues without it)
+    if (led.initLedDevice(allocator)) |device| {
+        state.led_device = device;
+    } else |err| {
+        std.log.warn("Failed to initialize LED device: {}", .{err});
+        std.log.warn("Service will continue without hardware access", .{});
+        std.log.warn("Make sure USB devices are connected and you have proper permissions", .{});
+    }
+    defer if (state.led_device) |*device| led.cleanupLedDevice(device);
 
     // Create socket server
     state.socket_server = try ipc.createSocketServer(socket_path, allocator);
@@ -119,47 +121,51 @@ pub fn runService(allocator: std.mem.Allocator) !void {
 
 fn masterPollingThread(state: *ServiceState) void {
     while (state.running.load(.acquire)) {
-        _ = led.device.queryMasterDevice(&state.led_device, state.led_device.active_channel) catch {};
+        if (state.led_device) |*device| {
+            _ = led.device.queryMasterDevice(device, device.active_channel) catch {};
+        }
         std.Thread.sleep(1 * std.time.ns_per_s);
     }
 }
 
 fn deviceQueryThread(state: *ServiceState) void {
     while (state.running.load(.acquire)) {
-        // Query devices multiple times
-        var all_devices = std.StringHashMap(led.RfDeviceInfo).init(state.allocator);
-        defer all_devices.deinit();
+        if (state.led_device) |*device| {
+            // Query devices multiple times
+            var all_devices = std.StringHashMap(led.RfDeviceInfo).init(state.allocator);
+            defer all_devices.deinit();
 
-        var attempt: usize = 0;
-        while (attempt < 10) : (attempt += 1) {
-            const devices = led.queryDevices(&state.led_device, state.allocator) catch continue;
-            defer state.allocator.free(devices);
+            var attempt: usize = 0;
+            while (attempt < 10) : (attempt += 1) {
+                const devices = led.queryDevices(device, state.allocator) catch continue;
+                defer state.allocator.free(devices);
 
-            for (devices) |device| {
-                if (device.rx_type != 255) {
-                    all_devices.put(device.mac_str, device) catch {};
+                for (devices) |dev| {
+                    if (dev.rx_type != 255) {
+                        all_devices.put(dev.mac_str, dev) catch {};
+                    }
                 }
+
+                if (all_devices.count() > 0) break;
+                std.Thread.sleep(100 * std.time.ns_per_ms);
             }
 
-            if (all_devices.count() > 0) break;
-            std.Thread.sleep(100 * std.time.ns_per_ms);
-        }
+            // Update cache
+            if (all_devices.count() > 0) {
+                state.devices_mutex.lock();
+                defer state.devices_mutex.unlock();
 
-        // Update cache
-        if (all_devices.count() > 0) {
-            state.devices_mutex.lock();
-            defer state.devices_mutex.unlock();
+                state.devices_cache.clearRetainingCapacity();
+                var it = all_devices.valueIterator();
+                while (it.next()) |dev| {
+                    state.devices_cache.append(state.allocator, dev.*) catch {};
+                }
 
-            state.devices_cache.clearRetainingCapacity();
-            var it = all_devices.valueIterator();
-            while (it.next()) |device| {
-                state.devices_cache.append(state.allocator, device.*) catch {};
+                // Save cache
+                device_cache.saveDeviceCache(state.devices_cache.items, state.allocator) catch {};
+
+                std.log.info("Found {} devices", .{state.devices_cache.items.len});
             }
-
-            // Save cache
-            device_cache.saveDeviceCache(state.devices_cache.items, state.allocator) catch {};
-
-            std.log.info("Found {} devices", .{state.devices_cache.items.len});
         }
 
         std.Thread.sleep(@as(u64, state.poll_interval_seconds) * std.time.ns_per_s);
@@ -191,9 +197,9 @@ fn handleSocketMessage(client_fd: std.posix.socket_t, state: *ServiceState) !voi
 
             const status = ipc_commands.StatusInfo{
                 .running = state.running.load(.acquire),
-                .master_mac = state.led_device.master_mac,
-                .active_channel = state.led_device.active_channel,
-                .fw_version = state.led_device.fw_version,
+                .master_mac = if (state.led_device) |dev| dev.master_mac else [_]u8{0} ** 6,
+                .active_channel = if (state.led_device) |dev| dev.active_channel else 0,
+                .fw_version = if (state.led_device) |dev| dev.fw_version else 0,
                 .device_count = @intCast(device_count),
             };
 
@@ -207,50 +213,130 @@ fn handleSocketMessage(client_fd: std.posix.socket_t, state: *ServiceState) !voi
             try ipc.sendMessage(client_fd, response);
         },
         .identify_device => {
-            // Parse identify request
-            const parsed = try std.json.parseFromSlice(ipc_commands.IdentifyRequest, state.allocator, msg.payload, .{});
-            defer parsed.deinit();
+            if (state.led_device) |*device| {
+                // Parse identify request
+                const parsed = try std.json.parseFromSlice(ipc_commands.IdentifyRequest, state.allocator, msg.payload, .{});
+                defer parsed.deinit();
 
-            // Convert to DeviceIdentifyInfo array
-            var identify_infos = try state.allocator.alloc(led.DeviceIdentifyInfo, parsed.value.devices.len);
-            defer state.allocator.free(identify_infos);
+                // Convert to DeviceIdentifyInfo array
+                var identify_infos = try state.allocator.alloc(led.DeviceIdentifyInfo, parsed.value.devices.len);
+                defer state.allocator.free(identify_infos);
 
-            for (parsed.value.devices, 0..) |device, i| {
-                var device_mac: [6]u8 = undefined;
+                for (parsed.value.devices, 0..) |dev, i| {
+                    var device_mac: [6]u8 = undefined;
 
-                // Remove colons from MAC address string
-                var mac_no_colons = try state.allocator.alloc(u8, 12);
-                defer state.allocator.free(mac_no_colons);
-                var idx: usize = 0;
-                for (device.mac_str) |c| {
-                    if (c != ':') {
-                        mac_no_colons[idx] = c;
-                        idx += 1;
+                    // Remove colons from MAC address string
+                    var mac_no_colons = try state.allocator.alloc(u8, 12);
+                    defer state.allocator.free(mac_no_colons);
+                    var idx: usize = 0;
+                    for (dev.mac_str) |c| {
+                        if (c != ':') {
+                            mac_no_colons[idx] = c;
+                            idx += 1;
+                        }
                     }
+
+                    _ = try std.fmt.hexToBytes(&device_mac, mac_no_colons[0..12]);
+
+                    identify_infos[i] = led.DeviceIdentifyInfo{
+                        .device_mac = device_mac,
+                        .rx_type = dev.rx_type,
+                        .channel = dev.channel,
+                    };
                 }
 
-                _ = try std.fmt.hexToBytes(&device_mac, mac_no_colons[0..12]);
-
-                identify_infos[i] = led.DeviceIdentifyInfo{
-                    .device_mac = device_mac,
-                    .rx_type = device.rx_type,
-                    .channel = device.channel,
+                // Send identify commands
+                led.identifyDevicesBatch(device, identify_infos, state.allocator) catch |err| {
+                    std.log.err("Failed to identify devices: {}", .{err});
+                    const response = ipc_commands.IpcMessage{
+                        .type = .err,
+                        .payload = "Failed to identify devices",
+                    };
+                    try ipc.sendMessage(client_fd, response);
+                    return;
                 };
-            }
 
-            // Send identify commands
-            led.identifyDevicesBatch(&state.led_device, identify_infos, state.allocator) catch |err| {
-                std.log.err("Failed to identify devices: {}", .{err});
                 const response = ipc_commands.IpcMessage{
-                    .type = .err,
-                    .payload = "Failed to identify devices",
+                    .type = .identify_success,
+                    .payload = "",
                 };
                 try ipc.sendMessage(client_fd, response);
-                return;
-            };
+            } else {
+                const response = ipc_commands.IpcMessage{
+                    .type = .err,
+                    .payload = "LED device not available",
+                };
+                try ipc.sendMessage(client_fd, response);
+            }
+        },
+        .set_effect => {
+            const parsed = try std.json.parseFromSlice(ipc_commands.EffectRequest, state.allocator, msg.payload, .{});
+            defer parsed.deinit();
+
+            const effect_req = parsed.value;
+
+            // Apply effect to each selected device
+            for (effect_req.devices) |device_entry| {
+                // Find full device info from cache
+                state.devices_mutex.lock();
+                var device_info: ?led.RfDeviceInfo = null;
+                for (state.devices_cache.items) |cached_device| {
+                    if (std.mem.eql(u8, cached_device.mac_str, device_entry.mac_str)) {
+                        device_info = cached_device;
+                        break;
+                    }
+                }
+                state.devices_mutex.unlock();
+
+                if (device_info == null) {
+                    std.log.warn("Device not found in cache: {s}", .{device_entry.mac_str});
+                    continue;
+                }
+
+                const device = device_info.?;
+
+                // Determine LED count
+                var leds_per_fan: usize = 40;
+                for (device.fan_types) |fan_type| {
+                    if (fan_type >= 28) {
+                        leds_per_fan = 26;
+                        break;
+                    }
+                }
+                const num_leds = leds_per_fan * device.fan_num;
+
+                // Generate effect data
+                const led_effects = @import("led_effects.zig");
+                const rgb_data = if (std.mem.eql(u8, effect_req.effect_name, "Static"))
+                    try led_effects.generateStaticColor(num_leds, effect_req.color1[0], effect_req.color1[1], effect_req.color1[2], state.allocator)
+                else if (std.mem.eql(u8, effect_req.effect_name, "Rainbow"))
+                    try led_effects.generateRainbow(num_leds, effect_req.brightness, state.allocator)
+                else if (std.mem.eql(u8, effect_req.effect_name, "Alternating"))
+                    try led_effects.generateAlternating(num_leds, effect_req.color1, effect_req.color2, 0, state.allocator)
+                else if (std.mem.eql(u8, effect_req.effect_name, "Breathing"))
+                    try led_effects.generateBreathing(num_leds, 680, effect_req.brightness, state.allocator)
+                else
+                    try led_effects.generateStaticColor(num_leds, effect_req.color1[0], effect_req.color1[1], effect_req.color1[2], state.allocator);
+
+                defer state.allocator.free(rgb_data);
+
+                // Apply effect
+                if (state.led_device) |*led_dev| {
+                    const led_operations = @import("led_operations.zig");
+                    const total_frames: u16 = if (std.mem.eql(u8, effect_req.effect_name, "Static") or std.mem.eql(u8, effect_req.effect_name, "Alternating")) 1 else 680;
+                    led_operations.setLedEffect(led_dev, device, rgb_data, total_frames, state.allocator) catch |err| {
+                        std.log.err("Failed to apply effect to device {s}: {}", .{ device.mac_str, err });
+                        continue;
+                    };
+
+                    std.log.info("Applied effect '{s}' to device {s}", .{ effect_req.effect_name, device.mac_str });
+                } else {
+                    std.log.warn("Cannot apply effect - LED device not available", .{});
+                }
+            }
 
             const response = ipc_commands.IpcMessage{
-                .type = .identify_success,
+                .type = .effect_applied,
                 .payload = "",
             };
             try ipc.sendMessage(client_fd, response);

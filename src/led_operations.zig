@@ -96,7 +96,7 @@ pub fn setLedEffect(
     const compressed = try allocator.alloc(u8, rgb_data.len * 2);
     defer allocator.free(compressed);
 
-    const compressed_size = try tinyuz.compress(rgb_data, compressed);
+    const compressed_size = try tinyuz.compressMem(rgb_data, compressed, 65535, allocator);
 
     // Build LED effect packets
     const rf_packets = try protocol.buildLedEffectPackets(

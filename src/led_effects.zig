@@ -142,7 +142,7 @@ pub fn generateAlternatingSpin(num_leds: usize, color1: [3]u8, color2: [3]u8, nu
 }
 
 pub fn generateRainbowMorph(num_leds: usize, num_frames: usize, brightness: u8, allocator: std.mem.Allocator) ![]u8 {
-    const brightness_val = @as(i32, brightness) * 255 / 100;
+    const brightness_val = @divTrunc(@as(i32, brightness) * 255, 100);
     const rgb_data = try allocator.alloc(u8, num_leds * 3 * num_frames);
 
     var all_frames: std.ArrayList(u8) = .{};
@@ -202,7 +202,7 @@ pub fn generateRainbowMorph(num_leds: usize, num_frames: usize, brightness: u8, 
 }
 
 pub fn generateBreathing(num_leds: usize, num_frames: usize, brightness: u8, allocator: std.mem.Allocator) ![]u8 {
-    const brightness_val = @as(i32, brightness) * 255 / 100;
+    const brightness_val = @divTrunc(@as(i32, brightness) * 255, 100);
     const rgb_data = try allocator.alloc(u8, num_leds * 3 * num_frames);
 
     const colors = [_][3]i32{

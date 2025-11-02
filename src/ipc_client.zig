@@ -137,6 +137,48 @@ pub const IpcClient = struct {
         }
     }
 
+    pub fn setEffect(self: *IpcClient, devices: []const device_cache.DeviceCacheEntry, effect_name: []const u8, color1: [3]u8, color2: [3]u8, brightness: u8) !void {
+        if (devices.len == 0) return;
+
+        var client = try ipc.connectToServer(self.socket_path, self.allocator);
+        defer ipc.closeClient(&client);
+
+        // Build simplified device list for effect request
+        var effect_devices = try self.allocator.alloc(ipc_commands.EffectDeviceInfo, devices.len);
+        defer self.allocator.free(effect_devices);
+
+        for (devices, 0..) |device, i| {
+            effect_devices[i] = ipc_commands.EffectDeviceInfo{
+                .mac_str = device.mac_str,
+            };
+        }
+
+        // Build effect request
+        const request = ipc_commands.EffectRequest{
+            .devices = effect_devices,
+            .effect_name = effect_name,
+            .color1 = color1,
+            .color2 = color2,
+            .brightness = brightness,
+        };
+
+        const json_string = try std.json.Stringify.valueAlloc(self.allocator, request, .{});
+        defer self.allocator.free(json_string);
+
+        const set_effect_msg = ipc_commands.IpcMessage{
+            .type = .set_effect,
+            .payload = json_string,
+        };
+        try ipc.sendMessage(client.socket_fd, set_effect_msg);
+
+        const response = try ipc.receiveMessage(client.socket_fd, self.allocator);
+        defer if (response.payload.len > 0) self.allocator.free(response.payload);
+
+        if (response.type == .err) {
+            return error.SetEffectFailed;
+        }
+    }
+
     pub fn freeDevices(self: *IpcClient, devices: []device_cache.DeviceCacheEntry) void {
         for (devices) |device| {
             self.allocator.free(device.mac_str);

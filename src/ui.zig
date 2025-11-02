@@ -13,6 +13,7 @@ pub const AppState = struct {
     window: *gtk.AdwApplicationWindow,
     devices: []device_cache.DeviceCacheEntry,
     selected_devices: std.ArrayList(bool),
+    device_toggle_buttons: std.ArrayList(?*gtk.GtkToggleButton),
     ipc: ipc_client.IpcClient,
 
     // UI widget references
@@ -60,6 +61,12 @@ pub fn createMainWindow(app: *gtk.AdwApplication, allocator: std.mem.Allocator) 
         sel.* = false;
     }
 
+    var device_toggle_buttons: std.ArrayList(?*gtk.GtkToggleButton) = .{};
+    try device_toggle_buttons.resize(allocator, devices.len);
+    for (device_toggle_buttons.items) |*btn| {
+        btn.* = null;
+    }
+
     // Initialize app state
     const app_state = try allocator.create(AppState);
     app_state.* = AppState{
@@ -67,6 +74,7 @@ pub fn createMainWindow(app: *gtk.AdwApplication, allocator: std.mem.Allocator) 
         .window = @ptrCast(window),
         .devices = devices,
         .selected_devices = selected_devices,
+        .device_toggle_buttons = device_toggle_buttons,
         .ipc = ipc,
         .device_list_box = null,
         .preview_area = null,
@@ -96,6 +104,16 @@ pub fn createMainWindow(app: *gtk.AdwApplication, allocator: std.mem.Allocator) 
     // Create refresh button
     const refresh_button = c.gtk_button_new_with_label("Refresh Devices");
     c.adw_header_bar_pack_end(@ptrCast(header_bar), @as(*gtk.GtkWidget, @ptrCast(refresh_button)));
+
+    // Connect refresh button signal
+    _ = c.g_signal_connect_data(
+        refresh_button,
+        "clicked",
+        @as(c.GCallback, @ptrCast(&onRefreshClicked)),
+        app_state,
+        null,
+        0,
+    );
 
     // Add header bar to main box
     c.gtk_box_append(@ptrCast(main_box), @as(*gtk.GtkWidget, @ptrCast(header_bar)));
@@ -147,6 +165,28 @@ fn onWindowClose(window: *gtk.GtkWindow, user_data: ?*anyopaque) callconv(.c) c.
     const app_state = @as(*AppState, @ptrCast(@alignCast(user_data.?)));
     app_state.poll_thread_running.store(false, .release);
     return 0; // Allow window to close
+}
+
+fn onRefreshClicked(button: *gtk.GtkButton, user_data: ?*anyopaque) callconv(.c) void {
+    _ = button;
+    const app_state = @as(*AppState, @ptrCast(@alignCast(user_data.?)));
+
+    // Fetch fresh device list from service
+    const new_devices = app_state.ipc.getDevices() catch |err| {
+        std.log.warn("Failed to refresh devices: {}", .{err});
+        return;
+    };
+
+    // Schedule UI update on main thread
+    const update_data = app_state.allocator.create(DeviceUpdateData) catch {
+        app_state.ipc.freeDevices(new_devices);
+        return;
+    };
+    update_data.* = DeviceUpdateData{
+        .app_state = app_state,
+        .new_devices = new_devices,
+    };
+    _ = c.g_idle_add(@ptrCast(&updateDevicesUI), update_data);
 }
 
 fn devicePollingThread(app_state: *AppState) void {

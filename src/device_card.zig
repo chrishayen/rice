@@ -101,6 +101,9 @@ pub fn createDeviceCard(device: *const device_cache.DeviceCacheEntry, index: usi
         0,
     );
 
+    // Store reference to toggle button
+    app_state.device_toggle_buttons.items[index] = @ptrCast(toggle_button);
+
     return @ptrCast(toggle_button);
 }
 

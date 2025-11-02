@@ -1,8 +1,20 @@
 const std = @import("std");
 const gtk = @import("gtk_bindings.zig");
 const ui = @import("ui.zig");
+const device_cache = @import("device_cache.zig");
+const ipc_client = @import("ipc_client.zig");
 
 const c = gtk.c;
+
+const ApplyThreadData = struct {
+    ipc: *ipc_client.IpcClient,
+    devices: []device_cache.DeviceCacheEntry,
+    effect_name: []const u8,
+    color1: [3]u8,
+    color2: [3]u8,
+    brightness: u8,
+    allocator: std.mem.Allocator,
+};
 
 const EFFECT_NAMES = [_][]const u8{
     "Static",
@@ -103,6 +115,14 @@ fn createControlsPanel(app_state: *ui.AppState) *gtk.GtkBox {
 
     const effect_dropdown = c.gtk_drop_down_new(@ptrCast(string_list), null);
     app_state.effect_dropdown = @ptrCast(effect_dropdown);
+    _ = c.g_signal_connect_data(
+        effect_dropdown,
+        "notify::selected",
+        @as(c.GCallback, @ptrCast(&onEffectChanged)),
+        app_state,
+        null,
+        0,
+    );
     c.gtk_box_append(@ptrCast(panel_box), @as(*gtk.GtkWidget, @ptrCast(effect_dropdown)));
 
     // Color pickers section
@@ -121,6 +141,14 @@ fn createControlsPanel(app_state: *ui.AppState) *gtk.GtkBox {
 
     const color1_button = c.gtk_color_button_new_with_rgba(&app_state.color1);
     app_state.color1_button = @ptrCast(color1_button);
+    _ = c.g_signal_connect_data(
+        color1_button,
+        "color-set",
+        @as(c.GCallback, @ptrCast(&onColor1Changed)),
+        app_state,
+        null,
+        0,
+    );
     c.gtk_box_append(@ptrCast(color1_box), @as(*gtk.GtkWidget, @ptrCast(color1_button)));
     c.gtk_box_append(@ptrCast(panel_box), @as(*gtk.GtkWidget, @ptrCast(color1_box)));
 
@@ -133,6 +161,14 @@ fn createControlsPanel(app_state: *ui.AppState) *gtk.GtkBox {
 
     const color2_button = c.gtk_color_button_new_with_rgba(&app_state.color2);
     app_state.color2_button = @ptrCast(color2_button);
+    _ = c.g_signal_connect_data(
+        color2_button,
+        "color-set",
+        @as(c.GCallback, @ptrCast(&onColor2Changed)),
+        app_state,
+        null,
+        0,
+    );
     c.gtk_box_append(@ptrCast(color2_box), @as(*gtk.GtkWidget, @ptrCast(color2_button)));
     c.gtk_box_append(@ptrCast(panel_box), @as(*gtk.GtkWidget, @ptrCast(color2_box)));
 
@@ -148,6 +184,14 @@ fn createControlsPanel(app_state: *ui.AppState) *gtk.GtkBox {
     c.gtk_range_set_value(@as(*c.GtkRange, @ptrCast(brightness_scale)), app_state.brightness);
     c.gtk_scale_set_draw_value(@ptrCast(brightness_scale), 1);
     c.gtk_scale_set_value_pos(@ptrCast(brightness_scale), c.GTK_POS_RIGHT);
+    _ = c.g_signal_connect_data(
+        brightness_scale,
+        "value-changed",
+        @as(c.GCallback, @ptrCast(&onBrightnessChanged)),
+        app_state,
+        null,
+        0,
+    );
     c.gtk_box_append(@ptrCast(panel_box), @as(*gtk.GtkWidget, @ptrCast(brightness_scale)));
 
     // Add spacer
@@ -164,9 +208,20 @@ fn createControlsPanel(app_state: *ui.AppState) *gtk.GtkBox {
 
     const apply_button = c.gtk_button_new_with_label("Apply");
     c.gtk_widget_add_css_class(@ptrCast(apply_button), "suggested-action");
+    _ = c.g_signal_connect_data(
+        apply_button,
+        "clicked",
+        @as(c.GCallback, @ptrCast(&onApplyClicked)),
+        app_state,
+        null,
+        0,
+    );
     c.gtk_box_append(@ptrCast(button_box), @as(*gtk.GtkWidget, @ptrCast(apply_button)));
 
     c.gtk_box_append(@ptrCast(panel_box), @as(*gtk.GtkWidget, @ptrCast(button_box)));
+
+    // Initially update visibility based on selected effect
+    updateEffectOptionsVisibility(app_state);
 
     return @ptrCast(panel_box);
 }
@@ -223,5 +278,147 @@ fn onDragUpdate(
     // Redraw preview
     if (app_state.preview_area) |preview_area| {
         c.gtk_widget_queue_draw(@ptrCast(preview_area));
+    }
+}
+
+fn onEffectChanged(dropdown: *gtk.GtkDropDown, _: *c.GParamSpec, user_data: ?*anyopaque) callconv(.c) void {
+    const app_state = @as(*ui.AppState, @ptrCast(@alignCast(user_data.?)));
+    app_state.selected_effect = @intCast(c.gtk_drop_down_get_selected(@ptrCast(dropdown)));
+    updateEffectOptionsVisibility(app_state);
+}
+
+fn onColor1Changed(color_button: *gtk.GtkColorButton, user_data: ?*anyopaque) callconv(.c) void {
+    const app_state = @as(*ui.AppState, @ptrCast(@alignCast(user_data.?)));
+    c.gtk_color_chooser_get_rgba(@as(*c.GtkColorChooser, @ptrCast(color_button)), &app_state.color1);
+}
+
+fn onColor2Changed(color_button: *gtk.GtkColorButton, user_data: ?*anyopaque) callconv(.c) void {
+    const app_state = @as(*ui.AppState, @ptrCast(@alignCast(user_data.?)));
+    c.gtk_color_chooser_get_rgba(@as(*c.GtkColorChooser, @ptrCast(color_button)), &app_state.color2);
+}
+
+fn onBrightnessChanged(scale: *gtk.GtkScale, user_data: ?*anyopaque) callconv(.c) void {
+    const app_state = @as(*ui.AppState, @ptrCast(@alignCast(user_data.?)));
+    app_state.brightness = c.gtk_range_get_value(@as(*c.GtkRange, @ptrCast(scale)));
+}
+
+fn onApplyClicked(button: *gtk.GtkButton, user_data: ?*anyopaque) callconv(.c) void {
+    _ = button;
+    const app_state = @as(*ui.AppState, @ptrCast(@alignCast(user_data.?)));
+
+    // Collect selected devices
+    var selected_devices: std.ArrayList(device_cache.DeviceCacheEntry) = .{};
+    defer selected_devices.deinit(app_state.allocator);
+
+    for (app_state.devices, 0..) |device, i| {
+        if (i < app_state.selected_devices.items.len and app_state.selected_devices.items[i]) {
+            selected_devices.append(app_state.allocator, device) catch continue;
+        }
+    }
+
+    if (selected_devices.items.len == 0) {
+        std.log.warn("No devices selected", .{});
+        return;
+    }
+
+    // Get effect name
+    const effect_name = EFFECT_NAMES[@intCast(app_state.selected_effect)];
+
+    // Convert colors
+    const color1 = [3]u8{
+        @intFromFloat(app_state.color1.red * 255.0),
+        @intFromFloat(app_state.color1.green * 255.0),
+        @intFromFloat(app_state.color1.blue * 255.0),
+    };
+    const color2 = [3]u8{
+        @intFromFloat(app_state.color2.red * 255.0),
+        @intFromFloat(app_state.color2.green * 255.0),
+        @intFromFloat(app_state.color2.blue * 255.0),
+    };
+    const brightness: u8 = @intFromFloat(app_state.brightness);
+
+    // Spawn thread to apply effect
+    const thread_data = app_state.allocator.create(ApplyThreadData) catch {
+        std.log.warn("Failed to allocate memory for apply thread", .{});
+        return;
+    };
+
+    thread_data.* = ApplyThreadData{
+        .ipc = &app_state.ipc,
+        .devices = selected_devices.toOwnedSlice(app_state.allocator) catch {
+            app_state.allocator.destroy(thread_data);
+            return;
+        },
+        .effect_name = effect_name,
+        .color1 = color1,
+        .color2 = color2,
+        .brightness = brightness,
+        .allocator = app_state.allocator,
+    };
+
+    const thread = std.Thread.spawn(.{}, applyEffectThread, .{thread_data}) catch |err| {
+        std.log.warn("Failed to spawn apply thread: {}", .{err});
+        app_state.allocator.free(thread_data.devices);
+        app_state.allocator.destroy(thread_data);
+        return;
+    };
+    thread.detach();
+
+    std.log.info("Applying effect '{s}' to {} devices", .{ effect_name, thread_data.devices.len });
+}
+
+fn applyEffectThread(thread_data: *ApplyThreadData) void {
+    defer {
+        thread_data.allocator.free(thread_data.devices);
+        thread_data.allocator.destroy(thread_data);
+    }
+
+    thread_data.ipc.setEffect(
+        thread_data.devices,
+        thread_data.effect_name,
+        thread_data.color1,
+        thread_data.color2,
+        thread_data.brightness,
+    ) catch |err| {
+        std.log.warn("Failed to apply effect: {}", .{err});
+    };
+}
+
+fn updateEffectOptionsVisibility(app_state: *ui.AppState) void {
+    const effect_name = EFFECT_NAMES[@intCast(app_state.selected_effect)];
+
+    // Determine which options are needed for this effect
+    const needs_color1 = std.mem.eql(u8, effect_name, "Static") or
+        std.mem.eql(u8, effect_name, "Alternating") or
+        std.mem.eql(u8, effect_name, "Breathing");
+
+    const needs_color2 = std.mem.eql(u8, effect_name, "Alternating");
+
+    const needs_brightness = std.mem.eql(u8, effect_name, "Rainbow") or
+        std.mem.eql(u8, effect_name, "Breathing");
+
+    // Show/hide widgets based on effect requirements
+    if (app_state.color1_button) |btn| {
+        if (needs_color1) {
+            c.gtk_widget_show(@as(*gtk.GtkWidget, @ptrCast(@alignCast(btn))));
+        } else {
+            c.gtk_widget_hide(@as(*gtk.GtkWidget, @ptrCast(@alignCast(btn))));
+        }
+    }
+
+    if (app_state.color2_button) |btn| {
+        if (needs_color2) {
+            c.gtk_widget_show(@as(*gtk.GtkWidget, @ptrCast(@alignCast(btn))));
+        } else {
+            c.gtk_widget_hide(@as(*gtk.GtkWidget, @ptrCast(@alignCast(btn))));
+        }
+    }
+
+    if (app_state.brightness_scale) |scale| {
+        if (needs_brightness) {
+            c.gtk_widget_show(@as(*gtk.GtkWidget, @ptrCast(@alignCast(scale))));
+        } else {
+            c.gtk_widget_hide(@as(*gtk.GtkWidget, @ptrCast(@alignCast(scale))));
+        }
     }
 }
