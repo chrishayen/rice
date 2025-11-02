@@ -1,6 +1,6 @@
 const std = @import("std");
 const gtk = @import("gtk_bindings.zig");
-const mock_data = @import("mock_data.zig");
+const device_cache = @import("device_cache.zig");
 const ui = @import("ui.zig");
 
 const c = gtk.c;
@@ -10,7 +10,7 @@ const DeviceCardData = struct {
     device_index: usize,
 };
 
-pub fn createDeviceCard(device: *const mock_data.Device, index: usize, app_state: *ui.AppState) *gtk.GtkToggleButton {
+pub fn createDeviceCard(device: *const device_cache.DeviceCacheEntry, index: usize, app_state: *ui.AppState) *gtk.GtkToggleButton {
     // Create toggle button for the card
     const toggle_button = c.gtk_toggle_button_new();
     c.gtk_widget_add_css_class(@ptrCast(toggle_button), "card");
@@ -22,34 +22,28 @@ pub fn createDeviceCard(device: *const mock_data.Device, index: usize, app_state
     c.gtk_widget_set_margin_top(@ptrCast(card_box), 12);
     c.gtk_widget_set_margin_bottom(@ptrCast(card_box), 12);
 
-    // Device name (bold)
+    // Device name (bold) - use device type name
     const name_label = c.gtk_label_new(null);
-    const name_markup = std.fmt.allocPrint(app_state.allocator, "<b>{s}</b>\x00", .{device.name}) catch unreachable;
+    const name_markup = std.fmt.allocPrint(app_state.allocator, "<b>{s}</b>\x00", .{device.dev_type_name}) catch unreachable;
     defer app_state.allocator.free(name_markup);
     c.gtk_label_set_markup(@ptrCast(name_label), @ptrCast(name_markup.ptr));
     c.gtk_widget_set_halign(@ptrCast(name_label), c.GTK_ALIGN_START);
     c.gtk_box_append(@ptrCast(card_box), @as(*gtk.GtkWidget, @ptrCast(name_label)));
 
     // MAC address
-    const mac_label = c.gtk_label_new(device.mac_address.ptr);
+    const mac_label = c.gtk_label_new(device.mac_str.ptr);
     c.gtk_widget_add_css_class(@ptrCast(mac_label), "dim-label");
     c.gtk_widget_set_halign(@ptrCast(mac_label), c.GTK_ALIGN_START);
     c.gtk_box_append(@ptrCast(card_box), @as(*gtk.GtkWidget, @ptrCast(mac_label)));
 
-    // Info box (fans, LEDs, channel)
+    // Info box (fans, channel)
     const info_box = c.gtk_box_new(gtk.GTK_ORIENTATION_HORIZONTAL, 12);
 
-    const fans_text = std.fmt.allocPrint(app_state.allocator, "Fans: {d}\x00", .{device.fan_count}) catch unreachable;
+    const fans_text = std.fmt.allocPrint(app_state.allocator, "Fans: {d}\x00", .{device.fan_num}) catch unreachable;
     defer app_state.allocator.free(fans_text);
     const fans_label = c.gtk_label_new(@ptrCast(fans_text.ptr));
     c.gtk_widget_add_css_class(@ptrCast(fans_label), "dim-label");
     c.gtk_box_append(@ptrCast(info_box), @as(*gtk.GtkWidget, @ptrCast(fans_label)));
-
-    const leds_text = std.fmt.allocPrint(app_state.allocator, "LEDs: {d}\x00", .{device.led_count}) catch unreachable;
-    defer app_state.allocator.free(leds_text);
-    const leds_label = c.gtk_label_new(@ptrCast(leds_text.ptr));
-    c.gtk_widget_add_css_class(@ptrCast(leds_label), "dim-label");
-    c.gtk_box_append(@ptrCast(info_box), @as(*gtk.GtkWidget, @ptrCast(leds_label)));
 
     const channel_text = std.fmt.allocPrint(app_state.allocator, "Ch: {d}\x00", .{device.channel}) catch unreachable;
     defer app_state.allocator.free(channel_text);
@@ -57,14 +51,22 @@ pub fn createDeviceCard(device: *const mock_data.Device, index: usize, app_state
     c.gtk_widget_add_css_class(@ptrCast(channel_label), "dim-label");
     c.gtk_box_append(@ptrCast(info_box), @as(*gtk.GtkWidget, @ptrCast(channel_label)));
 
+    // LCD indicator if device has LCD
+    if (device.has_lcd) {
+        const lcd_label = c.gtk_label_new("LCD");
+        c.gtk_widget_add_css_class(@ptrCast(lcd_label), "dim-label");
+        c.gtk_widget_add_css_class(@ptrCast(lcd_label), "success");
+        c.gtk_box_append(@ptrCast(info_box), @as(*gtk.GtkWidget, @ptrCast(lcd_label)));
+    }
+
     c.gtk_widget_set_halign(@ptrCast(info_box), c.GTK_ALIGN_START);
     c.gtk_box_append(@ptrCast(card_box), @as(*gtk.GtkWidget, @ptrCast(info_box)));
 
     // Binding status
-    const binding_text = if (device.is_bound) "Bound" else "Not Bound";
+    const binding_text = if (device.bound_to_us) "Bound" else "Not Bound";
     const binding_label = c.gtk_label_new(binding_text);
     c.gtk_widget_add_css_class(@ptrCast(binding_label), "dim-label");
-    if (device.is_bound) {
+    if (device.bound_to_us) {
         c.gtk_widget_add_css_class(@ptrCast(binding_label), "success");
     } else {
         c.gtk_widget_add_css_class(@ptrCast(binding_label), "warning");
@@ -99,6 +101,6 @@ fn onDeviceToggled(toggle_button: *gtk.GtkToggleButton, user_data: ?*anyopaque) 
     const data = @as(*DeviceCardData, @ptrCast(@alignCast(user_data.?)));
     const is_active = c.gtk_toggle_button_get_active(@ptrCast(toggle_button)) != 0;
 
-    data.app_state.selected_devices[data.device_index] = is_active;
+    data.app_state.selected_devices.items[data.device_index] = is_active;
     std.debug.print("Device {} toggled: {}\n", .{ data.device_index, is_active });
 }

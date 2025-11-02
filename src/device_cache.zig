@@ -88,17 +88,16 @@ pub fn saveDeviceCache(devices: []const led.RfDeviceInfo, allocator: std.mem.All
     };
 
     // Marshal to JSON
-    var json_string: std.ArrayList(u8) = .{};
-    defer json_string.deinit(allocator);
-
-    const writer = json_string.writer(allocator);
-    try writer.print("{any}", .{std.json.fmt(cache, .{ .whitespace = .indent_2 })});
+    const json_string = try std.json.Stringify.valueAlloc(allocator, cache, .{
+        .whitespace = .indent_2,
+    });
+    defer allocator.free(json_string);
 
     // Write to file
     const file = try std.fs.createFileAbsolute(cache_path, .{});
     defer file.close();
 
-    try file.writeAll(json_string.items);
+    try file.writeAll(json_string);
 }
 
 pub fn loadDeviceCache(allocator: std.mem.Allocator) ![]DeviceCacheEntry {

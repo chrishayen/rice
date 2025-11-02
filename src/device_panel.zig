@@ -74,14 +74,14 @@ fn onSelectAllClicked(button: *gtk.GtkButton, user_data: ?*anyopaque) callconv(.
 
     // Toggle all devices
     const all_selected = blk: {
-        for (app_state.selected_devices) |selected| {
+        for (app_state.selected_devices.items) |selected| {
             if (!selected) break :blk false;
         }
         break :blk true;
     };
 
     // Set all to opposite of current state
-    for (&app_state.selected_devices) |*selected| {
+    for (app_state.selected_devices.items) |*selected| {
         selected.* = !all_selected;
     }
 

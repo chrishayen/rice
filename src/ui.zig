@@ -3,14 +3,17 @@ const gtk = @import("gtk_bindings.zig");
 const mock_data = @import("mock_data.zig");
 const device_panel = @import("device_panel.zig");
 const led_effects_tab = @import("led_effects_tab.zig");
+const ipc_client = @import("ipc_client.zig");
+const device_cache = @import("device_cache.zig");
 
 const c = gtk.c;
 
 pub const AppState = struct {
     allocator: std.mem.Allocator,
     window: *gtk.AdwApplicationWindow,
-    devices: [3]mock_data.Device,
-    selected_devices: [3]bool,
+    devices: []device_cache.DeviceCacheEntry,
+    selected_devices: std.ArrayList(bool),
+    ipc: ipc_client.IpcClient,
 
     // UI widget references
     device_list_box: ?*gtk.GtkBox,
@@ -37,13 +40,31 @@ pub fn createMainWindow(app: *gtk.AdwApplication, allocator: std.mem.Allocator) 
     c.gtk_window_set_title(@as(*gtk.GtkWindow, @ptrCast(window)), "Rice Studio Beta");
     c.gtk_window_set_default_size(@as(*gtk.GtkWindow, @ptrCast(window)), 1200, 700);
 
+    // Initialize IPC client
+    var ipc = try ipc_client.IpcClient.init(allocator);
+    errdefer ipc.deinit();
+
+    // Try to get devices from service, fall back to empty list if service not running
+    const devices = ipc.getDevices() catch |err| blk: {
+        std.log.warn("Failed to connect to service: {}", .{err});
+        std.log.info("Starting with empty device list. Start the service with 'rice --server'", .{});
+        break :blk try allocator.alloc(device_cache.DeviceCacheEntry, 0);
+    };
+
+    var selected_devices: std.ArrayList(bool) = .{};
+    try selected_devices.resize(allocator, devices.len);
+    for (selected_devices.items) |*sel| {
+        sel.* = false;
+    }
+
     // Initialize app state
     const app_state = try allocator.create(AppState);
     app_state.* = AppState{
         .allocator = allocator,
         .window = @ptrCast(window),
-        .devices = mock_data.getMockDevices(),
-        .selected_devices = [_]bool{false} ** 3,
+        .devices = devices,
+        .selected_devices = selected_devices,
+        .ipc = ipc,
         .device_list_box = null,
         .preview_area = null,
         .effect_dropdown = null,
@@ -98,6 +119,30 @@ pub fn createMainWindow(app: *gtk.AdwApplication, allocator: std.mem.Allocator) 
 
     // Show window
     c.gtk_window_present(@as(*gtk.GtkWindow, @ptrCast(window)));
+
+    // Schedule identify devices to run asynchronously after UI is shown
+    if (devices.len > 0) {
+        _ = c.g_idle_add(@ptrCast(&identifyDevicesIdle), app_state);
+    }
+}
+
+fn identifyDevicesIdle(user_data: ?*anyopaque) callconv(.c) c.gboolean {
+    const app_state = @as(*AppState, @ptrCast(@alignCast(user_data.?)));
+
+    // Spawn a thread to avoid blocking the UI
+    const thread = std.Thread.spawn(.{}, identifyDevicesThread, .{app_state}) catch |err| {
+        std.log.warn("Failed to spawn identify thread: {}", .{err});
+        return 0;
+    };
+    thread.detach();
+
+    return 0; // Return 0 to remove the idle callback
+}
+
+fn identifyDevicesThread(app_state: *AppState) void {
+    app_state.ipc.identifyDevices(app_state.devices) catch |err| {
+        std.log.warn("Failed to identify devices: {}", .{err});
+    };
 }
 
 fn createTabView(app_state: *AppState) *c.GtkNotebook {

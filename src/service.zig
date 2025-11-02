@@ -175,15 +175,12 @@ fn handleSocketMessage(client_fd: std.posix.socket_t, state: *ServiceState) !voi
             const cached = try device_cache.loadDeviceCache(state.allocator);
             defer device_cache.freeCacheEntries(cached, state.allocator);
 
-            var json_string: std.ArrayList(u8) = .{};
-            defer json_string.deinit(state.allocator);
-
-            const writer = json_string.writer(state.allocator);
-            try writer.print("{any}", .{std.json.fmt(cached, .{})});
+            const json_string = try std.json.Stringify.valueAlloc(state.allocator, cached, .{});
+            defer state.allocator.free(json_string);
 
             const response = ipc_commands.IpcMessage{
                 .type = .devices_response,
-                .payload = json_string.items,
+                .payload = json_string,
             };
             try ipc.sendMessage(client_fd, response);
         },
@@ -200,15 +197,61 @@ fn handleSocketMessage(client_fd: std.posix.socket_t, state: *ServiceState) !voi
                 .device_count = @intCast(device_count),
             };
 
-            var json_string: std.ArrayList(u8) = .{};
-            defer json_string.deinit(state.allocator);
-
-            const writer = json_string.writer(state.allocator);
-            try writer.print("{any}", .{std.json.fmt(status, .{})});
+            const json_string = try std.json.Stringify.valueAlloc(state.allocator, status, .{});
+            defer state.allocator.free(json_string);
 
             const response = ipc_commands.IpcMessage{
                 .type = .status_response,
-                .payload = json_string.items,
+                .payload = json_string,
+            };
+            try ipc.sendMessage(client_fd, response);
+        },
+        .identify_device => {
+            // Parse identify request
+            const parsed = try std.json.parseFromSlice(ipc_commands.IdentifyRequest, state.allocator, msg.payload, .{});
+            defer parsed.deinit();
+
+            // Convert to DeviceIdentifyInfo array
+            var identify_infos = try state.allocator.alloc(led.DeviceIdentifyInfo, parsed.value.devices.len);
+            defer state.allocator.free(identify_infos);
+
+            for (parsed.value.devices, 0..) |device, i| {
+                var device_mac: [6]u8 = undefined;
+
+                // Remove colons from MAC address string
+                var mac_no_colons = try state.allocator.alloc(u8, 12);
+                defer state.allocator.free(mac_no_colons);
+                var idx: usize = 0;
+                for (device.mac_str) |c| {
+                    if (c != ':') {
+                        mac_no_colons[idx] = c;
+                        idx += 1;
+                    }
+                }
+
+                _ = try std.fmt.hexToBytes(&device_mac, mac_no_colons[0..12]);
+
+                identify_infos[i] = led.DeviceIdentifyInfo{
+                    .device_mac = device_mac,
+                    .rx_type = device.rx_type,
+                    .channel = device.channel,
+                };
+            }
+
+            // Send identify commands
+            led.identifyDevicesBatch(&state.led_device, identify_infos, state.allocator) catch |err| {
+                std.log.err("Failed to identify devices: {}", .{err});
+                const response = ipc_commands.IpcMessage{
+                    .type = .err,
+                    .payload = "Failed to identify devices",
+                };
+                try ipc.sendMessage(client_fd, response);
+                return;
+            };
+
+            const response = ipc_commands.IpcMessage{
+                .type = .identify_success,
+                .payload = "",
             };
             try ipc.sendMessage(client_fd, response);
         },

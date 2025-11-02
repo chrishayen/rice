@@ -50,7 +50,7 @@ pub fn sendRfPacket(dev: *types.LedDevice, rf_data: []const u8, channel: u8, rx_
         }
 
         if (delay_ms > 0) {
-            std.time.sleep(@intFromFloat(delay_ms * 1_000_000));
+            std.Thread.sleep(@intFromFloat(delay_ms * 1_000_000));
         }
     }
 }
