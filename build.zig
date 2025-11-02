@@ -83,11 +83,31 @@ pub fn build(b: *std.Build) void {
         }),
     });
 
-    // Link GTK4, Adwaita, and Cairo libraries
+    // Link GTK4, Adwaita, Cairo, and libusb libraries
     exe.linkLibC();
     exe.linkSystemLibrary("gtk4");
     exe.linkSystemLibrary("adwaita-1");
     exe.linkSystemLibrary("cairo");
+    exe.linkSystemLibrary("libusb-1.0");
+
+    // Add DES and TinyUZ dependencies
+    const des_dep = b.dependency("des", .{
+        .target = target,
+        .optimize = optimize,
+    });
+    const tinyuz_dep = b.dependency("tinyuz", .{
+        .target = target,
+        .optimize = optimize,
+    });
+
+    // Create modules for DES (no build.zig in repo)
+    const des_module = b.addModule("des", .{
+        .root_source_file = des_dep.path("des.zig"),
+    });
+    exe.root_module.addImport("des", des_module);
+
+    // TinyUZ has a build.zig with module
+    exe.root_module.addImport("tinyuz", tinyuz_dep.module("tinyuz"));
 
     // This declares intent for the executable to be installed into the
     // install prefix when running `zig build` (i.e. when executing the default
