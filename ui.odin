@@ -39,6 +39,9 @@ GtkScrolledWindow :: distinct rawptr
 GtkDropDown :: distinct rawptr
 GtkStringList :: distinct rawptr
 GApplication :: distinct rawptr
+GtkGesture :: distinct rawptr
+GtkGestureDrag :: distinct rawptr
+GdkModifierType :: distinct c.uint
 
 // Adwaita types
 AdwApplication :: distinct rawptr
@@ -159,6 +162,10 @@ foreign gtk {
 	gtk_drop_down_new :: proc(model: rawptr, expression: rawptr) -> GtkWidget ---
 	gtk_drop_down_set_selected :: proc(dropdown: GtkDropDown, position: c.uint) ---
 	gtk_drop_down_get_selected :: proc(dropdown: GtkDropDown) -> c.uint ---
+
+	gtk_gesture_drag_new :: proc() -> GtkGesture ---
+	gtk_widget_add_controller :: proc(widget: GtkWidget, controller: rawptr) ---
+	gtk_event_controller_set_propagation_phase :: proc(controller: rawptr, phase: c.int) ---
 }
 
 // Adwaita functions
@@ -271,6 +278,17 @@ App_State :: struct {
 	devices:               [dynamic]Device,
 	selected_devices:      [dynamic]bool,
 
+	// 3D model rendering
+	model:                 Model,
+	view:                  View_State,
+	model_loaded:          bool,
+
+	// Mouse drag state for 3D rotation
+	drag_start_x:          f64,
+	drag_start_y:          f64,
+	drag_start_rot_x:      f64,
+	drag_start_rot_y:      f64,
+
 	// Flag to prevent individual identify during batch operations
 	batch_selecting:       bool,
 }
@@ -328,6 +346,24 @@ run_ui :: proc() {
 	state.selected_devices = make([dynamic]bool)
 	state.device_toggle_buttons = make([dynamic]GtkToggleButton)
 
+	// Initialize 3D view
+	state.view = View_State {
+		rotation_x = 0.3,
+		rotation_y = 0.5,
+		zoom       = 1.0,
+	}
+
+	// Load 3D model
+	model, ok := parse_obj_file("sl120-finally.obj")
+	if ok {
+		state.model = model
+		state.model_loaded = true
+		log_info("3D model loaded successfully")
+	} else {
+		log_warn("Failed to load 3D model")
+		state.model_loaded = false
+	}
+
 	// Create Adwaita application
 	app := adw_application_new("dev.shotgun.rice", 0)
 	g_signal_connect_data(app, "activate", auto_cast on_activate, state, nil, 0)
@@ -339,6 +375,9 @@ run_ui :: proc() {
 	delete(state.devices)
 	delete(state.selected_devices)
 	delete(state.device_toggle_buttons)
+	if state.model_loaded {
+		free_model(&state.model)
+	}
 }
 
 on_activate :: proc "c" (app: AdwApplication, user_data: rawptr) {
@@ -594,6 +633,13 @@ build_preview_panel :: proc(state: ^App_State) -> GtkWidget {
 	gtk_drawing_area_set_draw_func(state.preview_area, draw_preview, state, nil)
 	gtk_frame_set_child(auto_cast frame, auto_cast state.preview_area)
 
+	// Add drag gesture for 3D rotation
+	drag_gesture := gtk_gesture_drag_new()
+	gtk_event_controller_set_propagation_phase(drag_gesture, 3) // GTK_PHASE_BUBBLE
+	g_signal_connect_data(drag_gesture, "drag-begin", auto_cast on_drag_begin, state, nil, 0)
+	g_signal_connect_data(drag_gesture, "drag-update", auto_cast on_drag_update, state, nil, 0)
+	gtk_widget_add_controller(auto_cast state.preview_area, drag_gesture)
+
 	return scrolled
 }
 
@@ -655,6 +701,13 @@ draw_preview :: proc "c" (
 
 	state := cast(^App_State)user_data
 
+	// Render the 3D model if loaded
+	if state.model_loaded {
+		render_model(cr, &state.model, state.view, width, height)
+		return
+	}
+
+	// Fallback: original 2D fan visualization
 	// Background
 	cairo_set_source_rgb(cr, 0.1, 0.1, 0.1)
 	cairo_paint(cr)
@@ -984,6 +1037,38 @@ on_apply_clicked :: proc "c" (button: GtkButton, user_data: rawptr) {
 
 	fmt.printfln("Applying effect: %s", EFFECTS[state.selected_effect].name)
 	// TODO: Call Python sl_led
+}
+
+// 3D view drag callbacks
+on_drag_begin :: proc "c" (gesture: GtkGestureDrag, start_x, start_y: c.double, user_data: rawptr) {
+	context = runtime.default_context()
+	state := cast(^App_State)user_data
+
+	if !state.model_loaded {
+		return
+	}
+
+	state.drag_start_x = f64(start_x)
+	state.drag_start_y = f64(start_y)
+	state.drag_start_rot_x = state.view.rotation_x
+	state.drag_start_rot_y = state.view.rotation_y
+}
+
+on_drag_update :: proc "c" (gesture: GtkGestureDrag, offset_x, offset_y: c.double, user_data: rawptr) {
+	context = runtime.default_context()
+	state := cast(^App_State)user_data
+
+	if !state.model_loaded {
+		return
+	}
+
+	// Update rotation based on drag
+	sensitivity :: 0.01
+	state.view.rotation_x = state.drag_start_rot_x + f64(offset_y) * sensitivity
+	state.view.rotation_y = state.drag_start_rot_y + f64(offset_x) * sensitivity
+
+	// Redraw the preview
+	gtk_widget_queue_draw(auto_cast state.preview_area)
 }
 
 // Effect generation
