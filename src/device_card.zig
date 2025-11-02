@@ -2,12 +2,19 @@ const std = @import("std");
 const gtk = @import("gtk_bindings.zig");
 const device_cache = @import("device_cache.zig");
 const ui = @import("ui.zig");
+const ipc_client = @import("ipc_client.zig");
 
 const c = gtk.c;
 
 const DeviceCardData = struct {
     app_state: *ui.AppState,
     device_index: usize,
+};
+
+const IdentifyThreadData = struct {
+    ipc: *ipc_client.IpcClient,
+    device: device_cache.DeviceCacheEntry,
+    allocator: std.mem.Allocator,
 };
 
 pub fn createDeviceCard(device: *const device_cache.DeviceCacheEntry, index: usize, app_state: *ui.AppState) *gtk.GtkToggleButton {
@@ -101,6 +108,38 @@ fn onDeviceToggled(toggle_button: *gtk.GtkToggleButton, user_data: ?*anyopaque) 
     const data = @as(*DeviceCardData, @ptrCast(@alignCast(user_data.?)));
     const is_active = c.gtk_toggle_button_get_active(@ptrCast(toggle_button)) != 0;
 
+    // Update selected state immediately
     data.app_state.selected_devices.items[data.device_index] = is_active;
     std.debug.print("Device {} toggled: {}\n", .{ data.device_index, is_active });
+
+    // If toggled on, spawn thread to send identify command
+    if (!is_active or data.device_index >= data.app_state.devices.len) return;
+
+    const device = data.app_state.devices[data.device_index];
+
+    const thread_data = data.app_state.allocator.create(IdentifyThreadData) catch {
+        std.log.warn("Failed to allocate memory for identify thread", .{});
+        return;
+    };
+
+    thread_data.* = IdentifyThreadData{
+        .ipc = &data.app_state.ipc,
+        .device = device,
+        .allocator = data.app_state.allocator,
+    };
+
+    const thread = std.Thread.spawn(.{}, identifyDeviceThread, .{thread_data}) catch |err| {
+        std.log.warn("Failed to spawn identify thread: {}", .{err});
+        data.app_state.allocator.destroy(thread_data);
+        return;
+    };
+    thread.detach();
+}
+
+fn identifyDeviceThread(thread_data: *IdentifyThreadData) void {
+    defer thread_data.allocator.destroy(thread_data);
+
+    thread_data.ipc.identifyDevices(&[_]device_cache.DeviceCacheEntry{thread_data.device}) catch |err| {
+        std.log.warn("Failed to identify device: {}", .{err});
+    };
 }

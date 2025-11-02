@@ -32,6 +32,9 @@ pub const AppState = struct {
     // Rendering state
     rotation_x: f64,
     rotation_y: f64,
+
+    // Polling thread control
+    poll_thread_running: std.atomic.Value(bool),
 };
 
 pub fn createMainWindow(app: *gtk.AdwApplication, allocator: std.mem.Allocator) !void {
@@ -77,6 +80,7 @@ pub fn createMainWindow(app: *gtk.AdwApplication, allocator: std.mem.Allocator) 
         .color2 = gtk.GdkRGBA{ .red = 0.0, .green = 0.0, .blue = 1.0, .alpha = 1.0 },
         .rotation_x = 0.0,
         .rotation_y = 0.0,
+        .poll_thread_running = std.atomic.Value(bool).init(true),
     };
 
     // Create main vertical box
@@ -120,29 +124,86 @@ pub fn createMainWindow(app: *gtk.AdwApplication, allocator: std.mem.Allocator) 
     // Show window
     c.gtk_window_present(@as(*gtk.GtkWindow, @ptrCast(window)));
 
-    // Schedule identify devices to run asynchronously after UI is shown
-    if (devices.len > 0) {
-        _ = c.g_idle_add(@ptrCast(&identifyDevicesIdle), app_state);
+    // Connect window close signal to stop polling thread
+    _ = c.g_signal_connect_data(
+        window,
+        "close-request",
+        @as(c.GCallback, @ptrCast(&onWindowClose)),
+        app_state,
+        null,
+        0,
+    );
+
+    // Spawn continuous polling thread
+    const thread = std.Thread.spawn(.{}, devicePollingThread, .{app_state}) catch |err| {
+        std.log.warn("Failed to spawn polling thread: {}", .{err});
+        return;
+    };
+    thread.detach();
+}
+
+fn onWindowClose(window: *gtk.GtkWindow, user_data: ?*anyopaque) callconv(.c) c.gboolean {
+    _ = window;
+    const app_state = @as(*AppState, @ptrCast(@alignCast(user_data.?)));
+    app_state.poll_thread_running.store(false, .release);
+    return 0; // Allow window to close
+}
+
+fn devicePollingThread(app_state: *AppState) void {
+    // First, identify devices on startup
+    if (app_state.devices.len > 0) {
+        app_state.ipc.identifyDevices(app_state.devices) catch |err| {
+            std.log.warn("Failed to identify devices: {}", .{err});
+        };
+    }
+
+    // Poll for device changes every 5 seconds
+    while (app_state.poll_thread_running.load(.acquire)) {
+        std.Thread.sleep(5 * std.time.ns_per_s);
+
+        if (!app_state.poll_thread_running.load(.acquire)) break;
+
+        // Get updated device list from service
+        const new_devices = app_state.ipc.getDevices() catch |err| {
+            std.log.warn("Failed to poll devices: {}", .{err});
+            continue;
+        };
+
+        // Schedule UI update on main thread
+        const update_data = app_state.allocator.create(DeviceUpdateData) catch continue;
+        update_data.* = DeviceUpdateData{
+            .app_state = app_state,
+            .new_devices = new_devices,
+        };
+        _ = c.g_idle_add(@ptrCast(&updateDevicesUI), update_data);
     }
 }
 
-fn identifyDevicesIdle(user_data: ?*anyopaque) callconv(.c) c.gboolean {
-    const app_state = @as(*AppState, @ptrCast(@alignCast(user_data.?)));
+const DeviceUpdateData = struct {
+    app_state: *AppState,
+    new_devices: []device_cache.DeviceCacheEntry,
+};
 
-    // Spawn a thread to avoid blocking the UI
-    const thread = std.Thread.spawn(.{}, identifyDevicesThread, .{app_state}) catch |err| {
-        std.log.warn("Failed to spawn identify thread: {}", .{err});
-        return 0;
-    };
-    thread.detach();
+fn updateDevicesUI(user_data: ?*anyopaque) callconv(.c) c.gboolean {
+    const update_data = @as(*DeviceUpdateData, @ptrCast(@alignCast(user_data.?)));
+    defer update_data.app_state.allocator.destroy(update_data);
 
-    return 0; // Return 0 to remove the idle callback
-}
+    // Free old devices
+    update_data.app_state.ipc.freeDevices(update_data.app_state.devices);
 
-fn identifyDevicesThread(app_state: *AppState) void {
-    app_state.ipc.identifyDevices(app_state.devices) catch |err| {
-        std.log.warn("Failed to identify devices: {}", .{err});
-    };
+    // Update app state with new devices
+    update_data.app_state.devices = update_data.new_devices;
+
+    // Resize selected_devices array
+    update_data.app_state.selected_devices.resize(
+        update_data.app_state.allocator,
+        update_data.new_devices.len,
+    ) catch return 0;
+
+    // TODO: Rebuild device list UI
+    std.log.info("Device list updated: {} devices", .{update_data.new_devices.len});
+
+    return 0; // Remove idle callback
 }
 
 fn createTabView(app_state: *AppState) *c.GtkNotebook {
