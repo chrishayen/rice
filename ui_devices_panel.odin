@@ -88,8 +88,10 @@ rebuild_device_list :: proc(state: ^App_State) {
 		child = next_child
 	}
 
-	// Clear toggle buttons and selection arrays
+	// Clear toggle buttons, bind/unbind buttons, and selection arrays
 	clear(&state.device_toggle_buttons)
+	clear(&state.bind_buttons)
+	clear(&state.unbind_buttons)
 	clear(&state.selected_devices)
 
 	// Add new device cards
@@ -97,8 +99,51 @@ rebuild_device_list :: proc(state: ^App_State) {
 	for device in state.devices {
 		if device.rx_type == 255 do continue
 
+		// Add device card
 		card := build_device_card(device, state, device_idx)
 		gtk_box_append(state.device_list_box, card)
+
+		// Add bind button (only for unbound devices)
+		if !device.bound {
+			bind_button := auto_cast gtk_button_new_with_label("Bind")
+			gtk_widget_add_css_class(bind_button, "suggested-action")
+			gtk_widget_set_margin_start(bind_button, 12)
+			gtk_widget_set_margin_end(bind_button, 12)
+			gtk_widget_set_margin_bottom(bind_button, 6)
+			gtk_widget_set_visible(bind_button, false) // Initially hidden
+
+			// Connect bind handler
+			bind_data := new(int)
+			bind_data^ = device_idx
+			g_signal_connect_data(bind_button, "clicked", auto_cast on_bind_clicked, bind_data, nil, 0)
+
+			gtk_box_append(state.device_list_box, bind_button)
+			append(&state.bind_buttons, bind_button)
+		} else {
+			// Add nil placeholder for bound devices to keep indices aligned
+			append(&state.bind_buttons, nil)
+		}
+
+		// Add unbind button (only for bound devices)
+		if device.bound {
+			unbind_button := auto_cast gtk_button_new_with_label("Unbind")
+			gtk_widget_add_css_class(unbind_button, "destructive-action")
+			gtk_widget_set_margin_start(unbind_button, 12)
+			gtk_widget_set_margin_end(unbind_button, 12)
+			gtk_widget_set_margin_bottom(unbind_button, 6)
+			gtk_widget_set_visible(unbind_button, false) // Initially hidden
+
+			// Connect unbind handler
+			unbind_data := new(int)
+			unbind_data^ = device_idx
+			g_signal_connect_data(unbind_button, "clicked", auto_cast on_unbind_clicked, unbind_data, nil, 0)
+
+			gtk_box_append(state.device_list_box, unbind_button)
+			append(&state.unbind_buttons, unbind_button)
+		} else {
+			// Add nil placeholder for unbound devices to keep indices aligned
+			append(&state.unbind_buttons, nil)
+		}
 
 		append(&state.selected_devices, false)
 		device_idx += 1
@@ -315,4 +360,168 @@ send_identify_requests :: proc(devices: []Device) {
 send_identify_request :: proc(device: Device) {
 	devices := []Device{device}
 	send_identify_requests(devices)
+}
+
+// Send unbind requests for multiple devices to service
+send_unbind_requests :: proc(devices: []Device) {
+	if len(devices) == 0 do return
+
+	// Get socket path
+	socket_path, path_err := get_socket_path()
+	defer delete(socket_path)
+
+	if path_err != .None {
+		log_warn("Failed to get socket path: %v", path_err)
+		return
+	}
+
+	// Connect to service
+	client, connect_err := connect_to_server(socket_path)
+	defer close_client(&client)
+
+	if connect_err != .None {
+		log_warn("Failed to connect to service: %v (is service running?)", connect_err)
+		return
+	}
+
+	// Build unbind request with all devices
+	device_infos := make([dynamic]Unbind_Device_Info, 0, len(devices))
+	defer delete(device_infos)
+
+	for device in devices {
+		append(&device_infos, Unbind_Device_Info{
+			mac_str = device.mac_str,
+			rx_type = device.rx_type,
+			channel = device.channel,
+		})
+	}
+
+	unbind_req := Unbind_Request{
+		devices = device_infos[:],
+	}
+
+	// Marshal to JSON
+	json_data, marshal_err := json.marshal(unbind_req)
+	if marshal_err != nil {
+		log_warn("Failed to marshal unbind request: %v", marshal_err)
+		return
+	}
+	defer delete(json_data)
+
+	// Send Unbind_Device request
+	request := IPC_Message{
+		type = .Unbind_Device,
+		payload = string(json_data),
+	}
+
+	send_err := send_message(client.socket_fd, request)
+	if send_err != .None {
+		log_warn("Failed to send Unbind_Device request: %v", send_err)
+		return
+	}
+
+	log_debug("Unbind request sent for %d device(s), waiting for response...", len(devices))
+
+	// Wait for success response
+	response, recv_err := receive_message(client.socket_fd)
+	if recv_err != .None {
+		log_warn("Failed to receive Unbind_Success response: %v", recv_err)
+		return
+	}
+	defer delete(response.payload)
+
+	if response.type == .Unbind_Success {
+		log_info("Unbind operation completed: %s device(s) unbound successfully", response.payload)
+	} else {
+		log_warn("Unexpected response type: %v", response.type)
+	}
+}
+
+// Send unbind request to service (single device convenience wrapper)
+send_unbind_request :: proc(device: Device) {
+	devices := []Device{device}
+	send_unbind_requests(devices)
+}
+
+// Send bind requests for multiple devices to service
+send_bind_requests :: proc(devices: []Device, target_rx_type: u8, target_channel: u8) {
+	if len(devices) == 0 do return
+
+	// Get socket path
+	socket_path, path_err := get_socket_path()
+	defer delete(socket_path)
+
+	if path_err != .None {
+		log_warn("Failed to get socket path: %v", path_err)
+		return
+	}
+
+	// Connect to service
+	client, connect_err := connect_to_server(socket_path)
+	defer close_client(&client)
+
+	if connect_err != .None {
+		log_warn("Failed to connect to service: %v (is service running?)", connect_err)
+		return
+	}
+
+	// Build bind request with all devices
+	device_infos := make([dynamic]Bind_Device_Info, 0, len(devices))
+	defer delete(device_infos)
+
+	for device in devices {
+		append(&device_infos, Bind_Device_Info{
+			mac_str = device.mac_str,
+			target_rx_type = target_rx_type,
+			target_channel = target_channel,
+			device_current_channel = device.channel,
+			device_current_rx_type = device.rx_type,
+		})
+	}
+
+	bind_req := Bind_Request{
+		devices = device_infos[:],
+	}
+
+	// Marshal to JSON
+	json_data, marshal_err := json.marshal(bind_req)
+	if marshal_err != nil {
+		log_warn("Failed to marshal bind request: %v", marshal_err)
+		return
+	}
+	defer delete(json_data)
+
+	// Send Bind_Device request
+	request := IPC_Message{
+		type = .Bind_Device,
+		payload = string(json_data),
+	}
+
+	send_err := send_message(client.socket_fd, request)
+	if send_err != .None {
+		log_warn("Failed to send Bind_Device request: %v", send_err)
+		return
+	}
+
+	log_debug("Bind request sent for %d device(s), waiting for response...", len(devices))
+
+	// Wait for success response
+	response, recv_err := receive_message(client.socket_fd)
+	if recv_err != .None {
+		log_warn("Failed to receive Bind_Success response: %v", recv_err)
+		return
+	}
+	defer delete(response.payload)
+
+	if response.type == .Bind_Success {
+		log_info("Bind operation completed: %s device(s) bound successfully", response.payload)
+	} else {
+		log_warn("Unexpected response type: %v", response.type)
+	}
+}
+
+// Send bind request to service (single device convenience wrapper)
+send_bind_request :: proc(device: Device, target_rx_type: u8, target_channel: u8) {
+	devices := []Device{device}
+	send_bind_requests(devices, target_rx_type, target_channel)
 }

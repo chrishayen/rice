@@ -4,6 +4,7 @@ package main
 
 import "core:c"
 import "core:encoding/json"
+import "core:fmt"
 import "core:os"
 import "core:strconv"
 import "core:strings"
@@ -201,6 +202,68 @@ master_polling_thread :: proc(data: rawptr) {
 	}
 
 	log_debug("Master polling thread stopped")
+}
+
+// Update device cache immediately (called after bind/unbind operations)
+refresh_device_cache :: proc(state: ^Service_State) {
+	log_debug("Refreshing device cache...")
+
+	// Query devices
+	MAX_QUERY_ATTEMPTS :: 5
+	all_devices := make(map[string]RF_Device_Info)
+	defer delete(all_devices)
+
+	for attempt in 0..<MAX_QUERY_ATTEMPTS {
+		devices, query_err := query_devices(&state.led_device)
+		if query_err == .None {
+			// Deduplicate devices by MAC address
+			for device in devices {
+				if device.rx_type != 255 {  // Skip master
+					all_devices[device.mac_str] = device
+				}
+			}
+		}
+
+		// If we found devices, we can stop early
+		if len(all_devices) > 0 {
+			log_debug("Found devices on attempt %d/%d", attempt + 1, MAX_QUERY_ATTEMPTS)
+			break
+		}
+
+		// Small delay between attempts
+		time.sleep(100 * time.Millisecond)
+	}
+
+	// Convert map to slice for cache
+	if len(all_devices) > 0 {
+		devices_slice := make([dynamic]RF_Device_Info, 0, len(all_devices))
+		defer delete(devices_slice)
+
+		for _, device in all_devices {
+			append(&devices_slice, device)
+		}
+
+		log_debug("Updating cache with %d devices", len(devices_slice))
+
+		// Lock mutex to update cache
+		sync.mutex_lock(&state.devices_mutex)
+		{
+			// Update cache - copy devices to cache
+			clear(&state.devices_cache)
+			for device in devices_slice {
+				append(&state.devices_cache, device)
+			}
+		}
+		sync.mutex_unlock(&state.devices_mutex)
+
+		// Save to JSON cache
+		cache_err := save_device_cache(devices_slice[:])
+		if cache_err != .None {
+			log_warn("Failed to save device cache: %v", cache_err)
+		} else {
+			log_debug("Device cache refreshed and saved")
+		}
+	}
 }
 
 // Device query thread - queries devices periodically and updates cache
@@ -516,6 +579,159 @@ handle_socket_message :: proc(client_fd: c.int, state: ^Service_State) {
 		}
 
 		// No response - this is fire-and-forget
+
+	case .Bind_Device:
+		log_debug("Handling Bind_Device request")
+
+		// Parse bind request from JSON
+		bind_req: Bind_Request
+		payload_bytes := transmute([]u8)msg.payload
+		unmarshal_err := json.unmarshal(payload_bytes, &bind_req)
+		if unmarshal_err != nil {
+			log_warn("Failed to unmarshal bind request: %v", unmarshal_err)
+			return
+		}
+		defer delete(bind_req.devices)
+
+		log_info("Binding %d device(s)", len(bind_req.devices))
+
+		// Bind each device
+		success_count := 0
+		for device_info in bind_req.devices {
+			log_info(
+				"Binding device: %s (target_rx_type=%d, target_channel=%d, current_rx_type=%d, current_channel=%d)",
+				device_info.mac_str,
+				device_info.target_rx_type,
+				device_info.target_channel,
+				device_info.device_current_rx_type,
+				device_info.device_current_channel,
+			)
+
+			// Parse MAC address
+			mac_parts := strings.split(device_info.mac_str, ":")
+			defer delete(mac_parts)
+
+			if len(mac_parts) != 6 {
+				log_warn("Invalid MAC address format: %s", device_info.mac_str)
+				continue
+			}
+
+			device_mac: [6]u8
+			parse_ok := true
+			for part, i in mac_parts {
+				val, ok := strconv.parse_u64_of_base(part, 16)
+				if !ok {
+					log_warn("Invalid MAC address byte: %s", part)
+					parse_ok = false
+					break
+				}
+				device_mac[i] = u8(val)
+			}
+
+			if !parse_ok do continue
+
+			// Bind the device
+			bind_err := bind_device(
+				&state.led_device,
+				device_mac,
+				device_info.target_rx_type,
+				device_info.target_channel,
+				device_info.device_current_channel,
+				device_info.device_current_rx_type,
+			)
+			if bind_err != .None {
+				log_warn("Failed to bind device %s: %v", device_info.mac_str, bind_err)
+			} else {
+				log_info("Device %s bound successfully", device_info.mac_str)
+				success_count += 1
+			}
+		}
+
+		// Refresh device cache to reflect new bind status
+		refresh_device_cache(state)
+
+		// Send success response
+		response := IPC_Message {
+			type    = .Bind_Success,
+			payload = fmt.tprintf("%d", success_count),
+		}
+
+		send_err := send_message(client_fd, response)
+		if send_err != .None {
+			log_warn("Failed to send Bind_Success response: %v", send_err)
+		}
+
+	case .Unbind_Device:
+		log_debug("Handling Unbind_Device request")
+
+		// Parse unbind request from JSON
+		unbind_req: Unbind_Request
+		payload_bytes := transmute([]u8)msg.payload
+		unmarshal_err := json.unmarshal(payload_bytes, &unbind_req)
+		if unmarshal_err != nil {
+			log_warn("Failed to unmarshal unbind request: %v", unmarshal_err)
+			return
+		}
+		defer delete(unbind_req.devices)
+
+		log_info("Unbinding %d device(s)", len(unbind_req.devices))
+
+		// Unbind each device
+		success_count := 0
+		for device_info in unbind_req.devices {
+			log_info(
+				"Unbinding device: %s (rx_type=%d, channel=%d)",
+				device_info.mac_str,
+				device_info.rx_type,
+				device_info.channel,
+			)
+
+			// Parse MAC address
+			mac_parts := strings.split(device_info.mac_str, ":")
+			defer delete(mac_parts)
+
+			if len(mac_parts) != 6 {
+				log_warn("Invalid MAC address format: %s", device_info.mac_str)
+				continue
+			}
+
+			device_mac: [6]u8
+			parse_ok := true
+			for part, i in mac_parts {
+				val, ok := strconv.parse_u64_of_base(part, 16)
+				if !ok {
+					log_warn("Invalid MAC address byte: %s", part)
+					parse_ok = false
+					break
+				}
+				device_mac[i] = u8(val)
+			}
+
+			if !parse_ok do continue
+
+			// Unbind the device
+			unbind_err := unbind_device(&state.led_device, device_mac, device_info.rx_type, device_info.channel)
+			if unbind_err != .None {
+				log_warn("Failed to unbind device %s: %v", device_info.mac_str, unbind_err)
+			} else {
+				log_info("Device %s unbound successfully", device_info.mac_str)
+				success_count += 1
+			}
+		}
+
+		// Refresh device cache to reflect new bind status
+		refresh_device_cache(state)
+
+		// Send success response
+		response := IPC_Message {
+			type    = .Unbind_Success,
+			payload = fmt.tprintf("%d", success_count),
+		}
+
+		send_err := send_message(client_fd, response)
+		if send_err != .None {
+			log_warn("Failed to send Unbind_Success response: %v", send_err)
+		}
 
 	case .Ping:
 		log_debug("Handling Ping request")

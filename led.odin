@@ -558,15 +558,28 @@ identify_devices_batch :: proc(dev: ^LED_Device, devices: []Device_Identify_Info
 }
 
 // Bind device to controller
-bind_device :: proc(dev: ^LED_Device, device_mac: [6]u8, rx_type: u8, channel: u8) -> LED_Error {
+bind_device :: proc(
+	dev: ^LED_Device,
+	device_mac: [6]u8,
+	target_rx_type: u8,          // NEW rx_type to assign to device
+	target_channel: u8,          // Master's channel (NEW channel for device)
+	device_current_channel: u8,  // Device's CURRENT channel (where to send packet)
+	device_current_rx_type: u8,  // Device's CURRENT rx_type (how to send packet)
+) -> LED_Error {
+	// Bind packet structure (from slv3.decompiled.cs:93163-93177 + 89081-89097):
+	// - Packet byte 14 (target_rx_type) = NEW rx_type for device
+	// - Packet byte 15 (target_channel) = Master's channel
+	// - Packet byte 16 (sequence) = non-zero (bind)
+	// BUT: Packet is sent ON device's CURRENT channel and rx_type
+
 	// Send bind command multiple times for reliability
 	for attempt in 0..<5 {
-		for try_rx_type in 1..=3 {
-			rf_packet := build_bind_packet(device_mac, dev.master_mac, u8(try_rx_type), channel, sequence = 1)
-			err := send_rf_packet(dev, rf_packet[:], channel, u8(try_rx_type), delay_ms = 0.5)
-			if err != .None {
-				return err
-			}
+		// Build packet with TARGET rx_type and channel in the packet
+		rf_packet := build_bind_packet(device_mac, dev.master_mac, target_rx_type, target_channel, sequence = 1)
+		// Send on device's CURRENT rx_type and channel so it can receive!
+		err := send_rf_packet(dev, rf_packet[:], device_current_channel, device_current_rx_type, delay_ms = 0.5)
+		if err != .None {
+			return err
 		}
 		time.sleep(100 * time.Millisecond)
 	}
@@ -576,16 +589,24 @@ bind_device :: proc(dev: ^LED_Device, device_mac: [6]u8, rx_type: u8, channel: u
 
 // Unbind device from controller
 unbind_device :: proc(dev: ^LED_Device, device_mac: [6]u8, rx_type: u8, channel: u8) -> LED_Error {
+	// Unbind packet structure (from slv3.decompiled.cs:93179-93187):
+	// - Packet byte 14 (target_rx_type) = 0
+	// - Packet byte 8-13 (target_master_mac) = 00:00:00:00:00:00
+	// - Packet byte 16 (sequence) = 0
+	// BUT: Packet is sent ON device's CURRENT channel and rx_type (slv3:95925)
+
+	empty_mac := [6]u8{0, 0, 0, 0, 0, 0}
+
 	// Send unbind command multiple times for reliability
 	for attempt in 0..<5 {
-		for try_rx_type in 1..=3 {
-			rf_packet := build_bind_packet(device_mac, dev.master_mac, u8(try_rx_type), channel, sequence = 0)
-			err := send_rf_packet(dev, rf_packet[:], channel, u8(try_rx_type), delay_ms = 0.5)
-			if err != .None {
-				return err
-			}
+		// Build packet with empty_mac, rx_type=0, sequence=0
+		rf_packet := build_bind_packet(device_mac, empty_mac, 0, channel, sequence = 0)
+		// Send on device's CURRENT rx_type, not target rx_type
+		err := send_rf_packet(dev, rf_packet[:], channel, rx_type, delay_ms = 0.5)
+		if err != .None {
+			return err
 		}
-		time.sleep(100 * time.Millisecond)
+		time.sleep(20 * time.Millisecond)
 	}
 
 	return .None

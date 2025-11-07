@@ -41,6 +41,10 @@ GtkStringList :: distinct rawptr
 GApplication :: distinct rawptr
 GtkGesture :: distinct rawptr
 GtkGestureDrag :: distinct rawptr
+GtkGestureClick :: distinct rawptr
+GtkGestureSingle :: distinct rawptr
+GtkEventController :: distinct rawptr
+GdkEventSequence :: distinct rawptr
 GdkModifierType :: distinct c.uint
 
 // Adwaita types
@@ -77,6 +81,19 @@ GtkPolicyType :: enum c.int {
 	ALWAYS    = 0,
 	AUTOMATIC = 1,
 	NEVER     = 2,
+}
+
+GtkPropagationPhase :: enum c.int {
+	NONE    = 0,
+	CAPTURE = 1,
+	BUBBLE  = 2,
+	TARGET  = 3,
+}
+
+GtkEventSequenceState :: enum c.int {
+	NONE    = 0,
+	CLAIMED = 1,
+	DENIED  = 2,
 }
 
 // GTK functions
@@ -145,6 +162,7 @@ foreign gtk {
 	gtk_widget_set_halign :: proc(widget: GtkWidget, align: GtkAlign) ---
 	gtk_widget_set_valign :: proc(widget: GtkWidget, align: GtkAlign) ---
 	gtk_widget_set_size_request :: proc(widget: GtkWidget, width, height: c.int) ---
+	gtk_widget_set_visible :: proc(widget: GtkWidget, visible: c.bool) ---
 	gtk_widget_queue_draw :: proc(widget: GtkWidget) ---
 	gtk_widget_add_css_class :: proc(widget: GtkWidget, css_class: cstring) ---
 	gtk_widget_get_first_child :: proc(widget: GtkWidget) -> GtkWidget ---
@@ -164,8 +182,12 @@ foreign gtk {
 	gtk_drop_down_get_selected :: proc(dropdown: GtkDropDown) -> c.uint ---
 
 	gtk_gesture_drag_new :: proc() -> GtkGesture ---
+	gtk_gesture_click_new :: proc() -> GtkGestureClick ---
+	gtk_gesture_single_set_button :: proc(gesture: GtkGestureSingle, button: c.uint) ---
+	gtk_gesture_single_get_current_sequence :: proc(gesture: GtkGestureSingle) -> GdkEventSequence ---
+	gtk_gesture_set_state :: proc(gesture: GtkGesture, sequence: GdkEventSequence, state: GtkEventSequenceState) -> c.bool ---
 	gtk_widget_add_controller :: proc(widget: GtkWidget, controller: rawptr) ---
-	gtk_event_controller_set_propagation_phase :: proc(controller: rawptr, phase: c.int) ---
+	gtk_event_controller_set_propagation_phase :: proc(controller: rawptr, phase: GtkPropagationPhase) ---
 }
 
 // Adwaita functions
@@ -212,9 +234,20 @@ foreign gio {
 	g_application_run :: proc(app: GApplication, argc: c.int, argv: rawptr) -> c.int ---
 }
 
+GSignalMatchType :: enum c.uint {
+	ID          = 1 << 0,
+	DETAIL      = 1 << 1,
+	CLOSURE     = 1 << 2,
+	FUNC        = 1 << 3,
+	DATA        = 1 << 4,
+	UNBLOCKED   = 1 << 5,
+}
+
 @(default_calling_convention = "c")
 foreign gobject {
 	g_signal_connect_data :: proc(instance: rawptr, detailed_signal: cstring, c_handler: rawptr, data: rawptr, destroy_data: rawptr, connect_flags: c.int) -> c.ulong ---
+	g_signal_handlers_block_matched :: proc(instance: rawptr, mask: c.uint, signal_id: c.uint, detail: c.uint, closure: rawptr, func: rawptr, data: rawptr) -> c.uint ---
+	g_signal_handlers_unblock_matched :: proc(instance: rawptr, mask: c.uint, signal_id: c.uint, detail: c.uint, closure: rawptr, func: rawptr, data: rawptr) -> c.uint ---
 	g_object_unref :: proc(object: rawptr) ---
 }
 
@@ -272,6 +305,8 @@ App_State :: struct {
 	effect_dropdown:       GtkDropDown,
 	device_list_box:       GtkBox,
 	device_toggle_buttons: [dynamic]GtkToggleButton,
+	bind_buttons:          [dynamic]GtkWidget, // Bind buttons shown below selected unbound devices
+	unbind_buttons:        [dynamic]GtkWidget, // Unbind buttons shown below selected bound devices
 
 	// Preview data
 	led_colors:            [dynamic][3]u8,
@@ -345,6 +380,8 @@ run_ui :: proc() {
 	state.devices = make([dynamic]Device)
 	state.selected_devices = make([dynamic]bool)
 	state.device_toggle_buttons = make([dynamic]GtkToggleButton)
+	state.bind_buttons = make([dynamic]GtkWidget)
+	state.unbind_buttons = make([dynamic]GtkWidget)
 
 	// Initialize 3D view
 	state.view = View_State {
@@ -635,7 +672,7 @@ build_preview_panel :: proc(state: ^App_State) -> GtkWidget {
 
 	// Add drag gesture for 3D rotation
 	drag_gesture := gtk_gesture_drag_new()
-	gtk_event_controller_set_propagation_phase(drag_gesture, 3) // GTK_PHASE_BUBBLE
+	gtk_event_controller_set_propagation_phase(drag_gesture, .TARGET) // GTK_PHASE_TARGET
 	g_signal_connect_data(drag_gesture, "drag-begin", auto_cast on_drag_begin, state, nil, 0)
 	g_signal_connect_data(drag_gesture, "drag-update", auto_cast on_drag_update, state, nil, 0)
 	gtk_widget_add_controller(auto_cast state.preview_area, drag_gesture)

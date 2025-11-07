@@ -9,6 +9,8 @@ Message_Type :: enum {
 	Set_Effect,
 	Get_Status,
 	Identify_Device,
+	Bind_Device,
+	Unbind_Device,
 	Ping,
 
 	// Service -> Client
@@ -16,6 +18,8 @@ Message_Type :: enum {
 	Status_Response,
 	Effect_Applied,
 	Identify_Success,
+	Bind_Success,
+	Unbind_Success,
 	Pong,
 	Error,
 }
@@ -48,6 +52,28 @@ Identify_Request :: struct {
 }
 
 Identify_Device_Info :: struct {
+	mac_str: string,
+	rx_type: u8,
+	channel: u8,
+}
+
+Bind_Request :: struct {
+	devices: []Bind_Device_Info,
+}
+
+Bind_Device_Info :: struct {
+	mac_str:                string,
+	target_rx_type:         u8,
+	target_channel:         u8,
+	device_current_channel: u8,
+	device_current_rx_type: u8,
+}
+
+Unbind_Request :: struct {
+	devices: []Unbind_Device_Info,
+}
+
+Unbind_Device_Info :: struct {
 	mac_str: string,
 	rx_type: u8,
 	channel: u8,

@@ -163,6 +163,22 @@ on_device_toggled :: proc "c" (button: GtkToggleButton, user_data: rawptr) {
 		is_active := gtk_toggle_button_get_active(button)
 		state.selected_devices[device_idx^] = bool(is_active)
 
+		// Show/hide corresponding bind button (for unbound devices)
+		if device_idx^ < len(state.bind_buttons) {
+			bind_button := state.bind_buttons[device_idx^]
+			if bind_button != nil {
+				gtk_widget_set_visible(bind_button, is_active)
+			}
+		}
+
+		// Show/hide corresponding unbind button (for bound devices)
+		if device_idx^ < len(state.unbind_buttons) {
+			unbind_button := state.unbind_buttons[device_idx^]
+			if unbind_button != nil {
+				gtk_widget_set_visible(unbind_button, is_active)
+			}
+		}
+
 		if is_active {
 			fmt.printfln("Selected device %d", device_idx^)
 
@@ -175,6 +191,47 @@ on_device_toggled :: proc "c" (button: GtkToggleButton, user_data: rawptr) {
 		} else {
 			fmt.printfln("Deselected device %d", device_idx^)
 		}
+	}
+}
+
+// Bind button click handler
+on_bind_clicked :: proc "c" (button: GtkButton, user_data: rawptr) {
+	context = runtime.default_context()
+	state := global_state
+	if state == nil do return
+
+	device_idx := cast(^int)user_data
+	if device_idx^ >= 0 && device_idx^ < len(state.devices) {
+		device := state.devices[device_idx^]
+		fmt.printfln("Binding device: %s", device.mac_str)
+
+		// Bind to channel 1 (default) and keep the device's current rx_type
+		target_channel: u8 = 1
+		target_rx_type := device.rx_type
+
+		send_bind_request(device, target_rx_type, target_channel)
+
+		// Refresh device list to update bind status
+		poll_devices_from_service(state)
+		rebuild_device_list(state)
+	}
+}
+
+// Unbind button click handler
+on_unbind_clicked :: proc "c" (button: GtkButton, user_data: rawptr) {
+	context = runtime.default_context()
+	state := global_state
+	if state == nil do return
+
+	device_idx := cast(^int)user_data
+	if device_idx^ >= 0 && device_idx^ < len(state.devices) {
+		device := state.devices[device_idx^]
+		fmt.printfln("Unbinding device: %s", device.mac_str)
+		send_unbind_request(device)
+
+		// Refresh device list to update bind status
+		poll_devices_from_service(state)
+		rebuild_device_list(state)
 	}
 }
 
