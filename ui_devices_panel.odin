@@ -148,6 +148,14 @@ rebuild_device_list :: proc(state: ^App_State) {
 		append(&state.selected_devices, false)
 		device_idx += 1
 	}
+
+	// Update LCD fan list when devices change
+	update_lcd_fan_list(state)
+
+	// Redraw LCD preview to reflect new state
+	if state.lcd_preview_area != nil {
+		gtk_widget_queue_draw(auto_cast state.lcd_preview_area)
+	}
 }
 
 // Select all button handler

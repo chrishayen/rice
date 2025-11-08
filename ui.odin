@@ -180,6 +180,7 @@ foreign gtk {
 	gtk_drop_down_new :: proc(model: rawptr, expression: rawptr) -> GtkWidget ---
 	gtk_drop_down_set_selected :: proc(dropdown: GtkDropDown, position: c.uint) ---
 	gtk_drop_down_get_selected :: proc(dropdown: GtkDropDown) -> c.uint ---
+	gtk_drop_down_set_model :: proc(dropdown: GtkDropDown, model: rawptr) ---
 
 	gtk_gesture_drag_new :: proc() -> GtkGesture ---
 	gtk_gesture_click_new :: proc() -> GtkGestureClick ---
@@ -328,6 +329,12 @@ App_State :: struct {
 
 	// Flag to prevent individual identify during batch operations
 	batch_selecting:       bool,
+
+	// LCD display controls
+	lcd_fan_dropdown:      GtkDropDown,
+	lcd_preview_area:      GtkDrawingArea,
+	selected_lcd_device:   int,  // Index into devices array, -1 if none selected
+	selected_lcd_fan:      int,  // Fan index within the device, -1 if none selected
 }
 
 Device :: struct {
@@ -384,6 +391,8 @@ run_ui :: proc() {
 	state.device_toggle_buttons = make([dynamic]GtkToggleButton)
 	state.bind_buttons = make([dynamic]GtkWidget)
 	state.unbind_buttons = make([dynamic]GtkWidget)
+	state.selected_lcd_device = -1
+	state.selected_lcd_fan = -1
 
 	// Initialize 3D view
 	state.view = View_State {
@@ -689,22 +698,393 @@ build_preview_panel :: proc(state: ^App_State) -> GtkWidget {
 }
 
 build_lcd_page :: proc(state: ^App_State) -> GtkWidget {
-	box := auto_cast gtk_box_new(.VERTICAL, 20)
-	gtk_widget_set_margin_start(box, 40)
-	gtk_widget_set_margin_top(box, 40)
+	paned := auto_cast gtk_paned_new(.HORIZONTAL)
 
-	title := auto_cast gtk_label_new("LCD Display Control")
-	gtk_label_set_markup(
-		auto_cast title,
-		"<span size='18000' weight='bold'>LCD Display Control</span>",
-	)
+	// Left: preview
+	preview := build_lcd_preview_panel(state)
+	gtk_paned_set_start_child(auto_cast paned, preview)
+	gtk_paned_set_resize_start_child(auto_cast paned, true)
+	gtk_paned_set_shrink_start_child(auto_cast paned, true)
+
+	// Right: controls
+	controls := build_lcd_controls(state)
+	gtk_paned_set_end_child(auto_cast paned, controls)
+	gtk_paned_set_resize_end_child(auto_cast paned, false)
+	gtk_paned_set_shrink_end_child(auto_cast paned, false)
+
+	gtk_paned_set_position(auto_cast paned, 600)
+
+	return paned
+}
+
+build_lcd_preview_panel :: proc(state: ^App_State) -> GtkWidget {
+	scrolled := auto_cast gtk_scrolled_window_new()
+	gtk_scrolled_window_set_policy(auto_cast scrolled, .NEVER, .AUTOMATIC)
+
+	box := auto_cast gtk_box_new(.VERTICAL, 12)
+	gtk_widget_set_margin_start(box, 20)
+	gtk_widget_set_margin_end(box, 20)
+	gtk_widget_set_margin_top(box, 20)
+	gtk_widget_set_margin_bottom(box, 20)
+	gtk_scrolled_window_set_child(auto_cast scrolled, box)
+
+	title := auto_cast gtk_label_new("LCD Preview")
+	gtk_label_set_markup(auto_cast title, "<span size='13000' weight='bold'>LCD Preview</span>")
+	gtk_label_set_xalign(auto_cast title, 0.0)
 	gtk_box_append(auto_cast box, title)
 
-	desc := auto_cast gtk_label_new("(Coming soon)")
-	gtk_widget_add_css_class(desc, "dim-label")
-	gtk_box_append(auto_cast box, desc)
+	// Frame for preview
+	frame := auto_cast gtk_frame_new(nil)
+	gtk_widget_set_vexpand(frame, true)
+	gtk_box_append(auto_cast box, frame)
 
-	return box
+	// Drawing area for LCD preview (400x400 to match actual LCD resolution)
+	state.lcd_preview_area = auto_cast gtk_drawing_area_new()
+	gtk_drawing_area_set_content_width(state.lcd_preview_area, 400)
+	gtk_drawing_area_set_content_height(state.lcd_preview_area, 400)
+	gtk_drawing_area_set_draw_func(state.lcd_preview_area, draw_lcd_preview, state, nil)
+	gtk_frame_set_child(auto_cast frame, auto_cast state.lcd_preview_area)
+
+	return scrolled
+}
+
+build_lcd_controls :: proc(state: ^App_State) -> GtkWidget {
+	scrolled := auto_cast gtk_scrolled_window_new()
+	gtk_scrolled_window_set_policy(auto_cast scrolled, .NEVER, .AUTOMATIC)
+
+	box := auto_cast gtk_box_new(.VERTICAL, 24)
+	gtk_widget_set_margin_start(box, 20)
+	gtk_widget_set_margin_end(box, 20)
+	gtk_widget_set_margin_top(box, 20)
+	gtk_widget_set_margin_bottom(box, 20)
+	gtk_scrolled_window_set_child(auto_cast scrolled, box)
+
+	// LCD Fan Selection group
+	fan_group := auto_cast adw_preferences_group_new()
+	adw_preferences_group_set_title(auto_cast fan_group, "LCD Fan Selection")
+	adw_preferences_group_set_description(auto_cast fan_group, "Select which LCD fan to configure")
+	gtk_box_append(auto_cast box, fan_group)
+
+	// LCD fan selector row
+	fan_row := auto_cast adw_action_row_new()
+	adw_preferences_row_set_title(fan_row, "Target LCD Fan")
+	fan_list := gtk_string_list_new(nil)
+	gtk_string_list_append(fan_list, "No LCD fans available")
+	state.lcd_fan_dropdown = auto_cast gtk_drop_down_new(fan_list, nil)
+	gtk_drop_down_set_selected(state.lcd_fan_dropdown, 0)
+	adw_action_row_add_suffix(auto_cast fan_row, auto_cast state.lcd_fan_dropdown)
+	adw_preferences_group_add(auto_cast fan_group, fan_row)
+
+	// Connect signal for dropdown selection changes
+	g_signal_connect_data(state.lcd_fan_dropdown, "notify::selected", auto_cast on_lcd_fan_selected, state, nil, 0)
+
+	// Populate LCD fan list (will be updated when devices are loaded)
+	update_lcd_fan_list(state)
+
+	// Video Source group
+	source_group := auto_cast adw_preferences_group_new()
+	adw_preferences_group_set_title(auto_cast source_group, "Video Source")
+	adw_preferences_group_set_description(auto_cast source_group, "Select frames directory for video playback")
+	gtk_box_append(auto_cast box, source_group)
+
+	// Frames directory row
+	frames_row := auto_cast adw_action_row_new()
+	adw_preferences_row_set_title(frames_row, "Frames Directory")
+	adw_action_row_set_subtitle(auto_cast frames_row, "No directory selected")
+
+	browse_btn := auto_cast gtk_button_new_with_label("Browse...")
+	adw_action_row_add_suffix(auto_cast frames_row, browse_btn)
+	adw_preferences_group_add(auto_cast source_group, frames_row)
+
+	// Playback Settings group
+	playback_group := auto_cast adw_preferences_group_new()
+	adw_preferences_group_set_title(auto_cast playback_group, "Playback Settings")
+	gtk_box_append(auto_cast box, playback_group)
+
+	// FPS row
+	fps_row := auto_cast adw_action_row_new()
+	adw_preferences_row_set_title(fps_row, "Frames Per Second")
+	fps_scale := auto_cast gtk_scale_new_with_range(.HORIZONTAL, 1, 60, 1)
+	gtk_range_set_value(fps_scale, 10)
+	gtk_scale_set_digits(auto_cast fps_scale, 0)
+	gtk_scale_set_draw_value(auto_cast fps_scale, true)
+	gtk_widget_set_hexpand(auto_cast fps_scale, true)
+	gtk_widget_set_size_request(auto_cast fps_scale, 200, -1)
+	adw_action_row_add_suffix(auto_cast fps_row, auto_cast fps_scale)
+	adw_preferences_group_add(auto_cast playback_group, fps_row)
+
+	// Loop option row
+	loop_row := auto_cast adw_action_row_new()
+	adw_preferences_row_set_title(loop_row, "Loop Playback")
+	adw_action_row_set_subtitle(auto_cast loop_row, "Repeat video continuously")
+	loop_switch := auto_cast gtk_check_button_new()
+	gtk_check_button_set_active(auto_cast loop_switch, false)
+	adw_action_row_add_suffix(auto_cast loop_row, loop_switch)
+	adw_action_row_set_activatable_widget(auto_cast loop_row, loop_switch)
+	adw_preferences_group_add(auto_cast playback_group, loop_row)
+
+	// Random start row
+	random_row := auto_cast adw_action_row_new()
+	adw_preferences_row_set_title(random_row, "Random Start")
+	adw_action_row_set_subtitle(auto_cast random_row, "Begin at random frame")
+	random_switch := auto_cast gtk_check_button_new()
+	gtk_check_button_set_active(auto_cast random_switch, false)
+	adw_action_row_add_suffix(auto_cast random_row, random_switch)
+	adw_action_row_set_activatable_widget(auto_cast random_row, random_switch)
+	adw_preferences_group_add(auto_cast playback_group, random_row)
+
+	// Transform Options group
+	transform_group := auto_cast adw_preferences_group_new()
+	adw_preferences_group_set_title(auto_cast transform_group, "Transform Options")
+	gtk_box_append(auto_cast box, transform_group)
+
+	// Zoom row
+	zoom_row := auto_cast adw_action_row_new()
+	adw_preferences_row_set_title(zoom_row, "Zoom (Center Crop)")
+	zoom_scale := auto_cast gtk_scale_new_with_range(.HORIZONTAL, 0, 90, 1)
+	gtk_range_set_value(zoom_scale, 0)
+	gtk_scale_set_digits(auto_cast zoom_scale, 0)
+	gtk_scale_set_draw_value(auto_cast zoom_scale, true)
+	gtk_widget_set_hexpand(auto_cast zoom_scale, true)
+	gtk_widget_set_size_request(auto_cast zoom_scale, 200, -1)
+	adw_action_row_add_suffix(auto_cast zoom_row, auto_cast zoom_scale)
+	adw_preferences_group_add(auto_cast transform_group, zoom_row)
+
+	// Rotation row
+	rotation_row := auto_cast adw_action_row_new()
+	adw_preferences_row_set_title(rotation_row, "Rotation (degrees)")
+	rotation_scale := auto_cast gtk_scale_new_with_range(.HORIZONTAL, 0, 360, 1)
+	gtk_range_set_value(rotation_scale, 0)
+	gtk_scale_set_digits(auto_cast rotation_scale, 0)
+	gtk_scale_set_draw_value(auto_cast rotation_scale, true)
+	gtk_widget_set_hexpand(auto_cast rotation_scale, true)
+	gtk_widget_set_size_request(auto_cast rotation_scale, 200, -1)
+	adw_action_row_add_suffix(auto_cast rotation_row, auto_cast rotation_scale)
+	adw_preferences_group_add(auto_cast transform_group, rotation_row)
+
+	// Rotation speed row
+	rot_speed_row := auto_cast adw_action_row_new()
+	adw_preferences_row_set_title(rot_speed_row, "Rotation Speed (deg/frame)")
+	rot_speed_scale := auto_cast gtk_scale_new_with_range(.HORIZONTAL, 0, 10, 0.1)
+	gtk_range_set_value(rot_speed_scale, 0)
+	gtk_scale_set_digits(auto_cast rot_speed_scale, 1)
+	gtk_scale_set_draw_value(auto_cast rot_speed_scale, true)
+	gtk_widget_set_hexpand(auto_cast rot_speed_scale, true)
+	gtk_widget_set_size_request(auto_cast rot_speed_scale, 200, -1)
+	adw_action_row_add_suffix(auto_cast rot_speed_row, auto_cast rot_speed_scale)
+	adw_preferences_group_add(auto_cast transform_group, rot_speed_row)
+
+	// Rotation direction row
+	rot_dir_row := auto_cast adw_action_row_new()
+	adw_preferences_row_set_title(rot_dir_row, "Rotation Direction")
+	rot_dir_list := gtk_string_list_new(nil)
+	gtk_string_list_append(rot_dir_list, "Counter-Clockwise")
+	gtk_string_list_append(rot_dir_list, "Clockwise")
+	rot_dir_dropdown := auto_cast gtk_drop_down_new(rot_dir_list, nil)
+	gtk_drop_down_set_selected(auto_cast rot_dir_dropdown, 0)
+	adw_action_row_add_suffix(auto_cast rot_dir_row, auto_cast rot_dir_dropdown)
+	adw_preferences_group_add(auto_cast transform_group, rot_dir_row)
+
+	// Flip horizontal row
+	flip_row := auto_cast adw_action_row_new()
+	adw_preferences_row_set_title(flip_row, "Flip Horizontal")
+	flip_switch := auto_cast gtk_check_button_new()
+	gtk_check_button_set_active(auto_cast flip_switch, false)
+	adw_action_row_add_suffix(auto_cast flip_row, flip_switch)
+	adw_action_row_set_activatable_widget(auto_cast flip_row, flip_switch)
+	adw_preferences_group_add(auto_cast transform_group, flip_row)
+
+	// Overlay Options group
+	overlay_group := auto_cast adw_preferences_group_new()
+	adw_preferences_group_set_title(auto_cast overlay_group, "Overlay Options")
+	gtk_box_append(auto_cast box, overlay_group)
+
+	// Overlay type row
+	overlay_row := auto_cast adw_action_row_new()
+	adw_preferences_row_set_title(overlay_row, "Overlay Type")
+	overlay_list := gtk_string_list_new(nil)
+	gtk_string_list_append(overlay_list, "None")
+	gtk_string_list_append(overlay_list, "CPU Usage")
+	gtk_string_list_append(overlay_list, "GPU Usage")
+	gtk_string_list_append(overlay_list, "Memory Usage")
+	gtk_string_list_append(overlay_list, "CPU Temperature")
+	gtk_string_list_append(overlay_list, "Time")
+	gtk_string_list_append(overlay_list, "FPS Counter")
+	overlay_dropdown := auto_cast gtk_drop_down_new(overlay_list, nil)
+	gtk_drop_down_set_selected(auto_cast overlay_dropdown, 0)
+	adw_action_row_add_suffix(auto_cast overlay_row, auto_cast overlay_dropdown)
+	adw_preferences_group_add(auto_cast overlay_group, overlay_row)
+
+	// Colorful text row
+	colorful_row := auto_cast adw_action_row_new()
+	adw_preferences_row_set_title(colorful_row, "Colorful Text")
+	adw_action_row_set_subtitle(auto_cast colorful_row, "Use colored text (green/yellow/red)")
+	colorful_switch := auto_cast gtk_check_button_new()
+	gtk_check_button_set_active(auto_cast colorful_switch, false)
+	adw_action_row_add_suffix(auto_cast colorful_row, colorful_switch)
+	adw_action_row_set_activatable_widget(auto_cast colorful_row, colorful_switch)
+	adw_preferences_group_add(auto_cast overlay_group, colorful_row)
+
+	// Dark bar row
+	darkbar_row := auto_cast adw_action_row_new()
+	adw_preferences_row_set_title(darkbar_row, "Dark Bar Background")
+	adw_action_row_set_subtitle(auto_cast darkbar_row, "Add dark translucent bar behind text")
+	darkbar_switch := auto_cast gtk_check_button_new()
+	gtk_check_button_set_active(auto_cast darkbar_switch, false)
+	adw_action_row_add_suffix(auto_cast darkbar_row, darkbar_switch)
+	adw_action_row_set_activatable_widget(auto_cast darkbar_row, darkbar_switch)
+	adw_preferences_group_add(auto_cast overlay_group, darkbar_row)
+
+	// Bedtime hour row (for time overlay)
+	bedtime_row := auto_cast adw_action_row_new()
+	adw_preferences_row_set_title(bedtime_row, "Bedtime Hour (24h)")
+	adw_action_row_set_subtitle(auto_cast bedtime_row, "For time overlay color zones")
+	bedtime_scale := auto_cast gtk_scale_new_with_range(.HORIZONTAL, 0, 23, 1)
+	gtk_range_set_value(bedtime_scale, 22)
+	gtk_scale_set_digits(auto_cast bedtime_scale, 0)
+	gtk_scale_set_draw_value(auto_cast bedtime_scale, true)
+	gtk_widget_set_hexpand(auto_cast bedtime_scale, true)
+	gtk_widget_set_size_request(auto_cast bedtime_scale, 200, -1)
+	adw_action_row_add_suffix(auto_cast bedtime_row, auto_cast bedtime_scale)
+	adw_preferences_group_add(auto_cast overlay_group, bedtime_row)
+
+	// Show volume row
+	volume_row := auto_cast adw_action_row_new()
+	adw_preferences_row_set_title(volume_row, "Show Volume Changes")
+	adw_action_row_set_subtitle(auto_cast volume_row, "Display volume bar on changes")
+	volume_switch := auto_cast gtk_check_button_new()
+	gtk_check_button_set_active(auto_cast volume_switch, false)
+	adw_action_row_add_suffix(auto_cast volume_row, volume_switch)
+	adw_action_row_set_activatable_widget(auto_cast volume_row, volume_switch)
+	adw_preferences_group_add(auto_cast overlay_group, volume_row)
+
+	// Action buttons
+	button_box := auto_cast gtk_box_new(.HORIZONTAL, 12)
+	gtk_widget_set_halign(button_box, .CENTER)
+	gtk_widget_set_margin_top(button_box, 20)
+	gtk_box_append(auto_cast box, button_box)
+
+	play_btn := auto_cast gtk_button_new_with_label("Play Video")
+	gtk_widget_add_css_class(play_btn, "suggested-action")
+	gtk_widget_add_css_class(play_btn, "pill")
+	gtk_widget_set_size_request(play_btn, 150, 48)
+	gtk_box_append(auto_cast button_box, play_btn)
+
+	stop_btn := auto_cast gtk_button_new_with_label("Stop")
+	gtk_widget_add_css_class(stop_btn, "destructive-action")
+	gtk_widget_add_css_class(stop_btn, "pill")
+	gtk_widget_set_size_request(stop_btn, 150, 48)
+	gtk_box_append(auto_cast button_box, stop_btn)
+
+	return scrolled
+}
+
+// Drawing function for LCD preview
+draw_lcd_preview :: proc "c" (
+	area: GtkDrawingArea,
+	cr: cairo_t,
+	width, height: c.int,
+	user_data: rawptr,
+) {
+	context = runtime.default_context()
+
+	state := cast(^App_State)user_data
+
+	// Background - dark to simulate LCD screen
+	cairo_set_source_rgb(cr, 0.05, 0.05, 0.05)
+	cairo_paint(cr)
+
+	// Determine state and show appropriate message
+	text: cstring
+	subtitle: cstring = nil
+
+	// Check if we have any devices loaded
+	if len(state.devices) == 0 {
+		// State 1: No devices loaded yet
+		text = "No devices detected"
+		subtitle = "Click 'Refresh Devices' to scan for fans"
+		cairo_set_source_rgb(cr, 0.6, 0.4, 0.4)  // Reddish tint
+	} else {
+		// Check if we have any LCD fans available
+		has_lcd_fans := false
+		for device in state.devices {
+			if device.has_lcd {
+				has_lcd_fans = true
+				break
+			}
+		}
+
+		if !has_lcd_fans {
+			// State 2: Devices loaded but none have LCD
+			text = "No LCD fans available"
+			subtitle = "Connect SL 120 LCD fans to use this feature"
+			cairo_set_source_rgb(cr, 0.6, 0.5, 0.3)  // Yellowish tint
+		} else if state.selected_lcd_device == -1 {
+			// State 3: LCD fans available but none selected
+			text = "No LCD fan selected"
+			subtitle = "Choose a fan from the dropdown above"
+			cairo_set_source_rgb(cr, 0.5, 0.5, 0.5)  // Gray
+		} else {
+			// State 4: LCD fan selected, ready for video
+			text = "Ready to play"
+			subtitle = "Select a video source and click Play"
+			cairo_set_source_rgb(cr, 0.3, 0.6, 0.3)  // Greenish tint
+		}
+	}
+
+	// Draw main message
+	cairo_select_font_face(cr, "Inter", 0, 0)
+	cairo_set_font_size(cr, 16)
+
+	extents: cairo_text_extents_t
+	cairo_text_extents(cr, text, &extents)
+
+	x := (c.double(width) - extents.width) / 2
+	y := c.double(height) / 2 - 10
+
+	cairo_move_to(cr, x, y)
+	cairo_show_text(cr, text)
+
+	// Draw subtitle if present
+	if subtitle != nil {
+		cairo_set_font_size(cr, 12)
+		cairo_set_source_rgb(cr, 0.4, 0.4, 0.4)
+
+		cairo_text_extents(cr, subtitle, &extents)
+		sub_x := (c.double(width) - extents.width) / 2
+		sub_y := c.double(height) / 2 + 15
+
+		cairo_move_to(cr, sub_x, sub_y)
+		cairo_show_text(cr, subtitle)
+	}
+
+	// If a fan is selected, show device info at top
+	if state.selected_lcd_device >= 0 && state.selected_lcd_device < len(state.devices) {
+		device := state.devices[state.selected_lcd_device]
+
+		cairo_set_font_size(cr, 12)
+		cairo_set_source_rgb(cr, 0.6, 0.6, 0.6)
+
+		// Show device and fan info at top
+		info_text := fmt.tprintf("Device: %s | Fan: %d", device.mac_str, state.selected_lcd_fan)
+		info_cstr := strings.clone_to_cstring(info_text)
+		defer delete(info_cstr)
+
+		cairo_text_extents(cr, info_cstr, &extents)
+		info_x := (c.double(width) - extents.width) / 2
+		cairo_move_to(cr, info_x, 30)
+		cairo_show_text(cr, info_cstr)
+	}
+
+	// Draw LCD screen border to show 400x400 area
+	cairo_set_source_rgba(cr, 0.3, 0.3, 0.3, 0.5)
+	cairo_set_line_width(cr, 2)
+	cairo_move_to(cr, 0, 0)
+	cairo_line_to(cr, c.double(width), 0)
+	cairo_line_to(cr, c.double(width), c.double(height))
+	cairo_line_to(cr, 0, c.double(height))
+	cairo_close_path(cr)
+	cairo_stroke(cr)
 }
 
 build_settings_page :: proc(state: ^App_State) -> GtkWidget {
@@ -1119,6 +1499,81 @@ on_apply_clicked :: proc "c" (button: GtkButton, user_data: rawptr) {
 
 	// Send effect request to service
 	send_effect_request(selected_devices[:], state.selected_effect, state.color1, state.color2, state.brightness)
+}
+
+// LCD fan selection callback
+on_lcd_fan_selected :: proc "c" (dropdown: GtkDropDown, pspec: rawptr, user_data: rawptr) {
+	context = runtime.default_context()
+	state := cast(^App_State)user_data
+
+	selected := int(gtk_drop_down_get_selected(dropdown))
+
+	// First entry is always "No LCD fans available" placeholder
+	if selected == 0 {
+		state.selected_lcd_device = -1
+		state.selected_lcd_fan = -1
+		return
+	}
+
+	// Calculate which device and fan based on selection
+	// Format: each LCD device contributes fan_count entries
+	lcd_fan_count := 0
+	for device, dev_idx in state.devices {
+		if !device.has_lcd do continue
+
+		for fan_idx in 0..<device.fan_count {
+			lcd_fan_count += 1
+			if lcd_fan_count == selected {
+				state.selected_lcd_device = dev_idx
+				state.selected_lcd_fan = fan_idx
+				fmt.printfln("Selected LCD fan: Device %d, Fan %d", dev_idx, fan_idx)
+
+				// Redraw LCD preview
+				gtk_widget_queue_draw(auto_cast state.lcd_preview_area)
+				return
+			}
+		}
+	}
+}
+
+// Update LCD fan dropdown list
+update_lcd_fan_list :: proc(state: ^App_State) {
+	if state.lcd_fan_dropdown == nil {
+		return
+	}
+
+	// Create new string list
+	fan_list := gtk_string_list_new(nil)
+
+	has_lcd_fans := false
+	for device in state.devices {
+		if !device.has_lcd do continue
+		has_lcd_fans = true
+
+		// Add each fan from this device
+		for fan_idx in 0..<device.fan_count {
+			// Format: "Device XX:XX:XX - Fan N"
+			mac_short := device.mac_str[len(device.mac_str)-8:] if len(device.mac_str) >= 8 else device.mac_str
+			label := fmt.aprintf("Device %s - Fan %d", mac_short, fan_idx)
+			defer delete(label)
+
+			label_cstr := strings.clone_to_cstring(label)
+			defer delete(label_cstr)
+
+			gtk_string_list_append(fan_list, label_cstr)
+		}
+	}
+
+	if !has_lcd_fans {
+		gtk_string_list_append(fan_list, "No LCD fans available")
+		// Reset selection when no LCD fans
+		state.selected_lcd_device = -1
+		state.selected_lcd_fan = -1
+	}
+
+	// Update dropdown model
+	gtk_drop_down_set_model(state.lcd_fan_dropdown, fan_list)
+	gtk_drop_down_set_selected(state.lcd_fan_dropdown, 0)
 }
 
 // 3D view drag callbacks
