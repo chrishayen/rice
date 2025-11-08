@@ -1,3 +1,30 @@
-*.py
-*.md
+# Build artifacts
+*.o
+*.so
+*.dylib
+*.dll
+*.exe
 rice
+test_ffi
+
+# Test outputs
+*.bin
+
+# Python
+__pycache__/
+*.pyc
+
+# Temporary files
+dump_*.odin
+
+# IDE
+.vscode/
+.idea/
+
+# Zig build
+.zig-cache/
+zig-out/
+
+# External dependencies (built from zon)
+libs/HDiffPatch/
+libs/tinyuz/*.a

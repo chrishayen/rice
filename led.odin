@@ -436,7 +436,7 @@ build_led_effect_packets :: proc(
 	packets_list := make([dynamic][RF_PACKET_SIZE]u8, 0, total_pk_num + 1, allocator)
 
 	// Metadata packet (packet_idx=0)
-	metadata: [RF_PACKET_SIZE]u8
+	metadata: [RF_PACKET_SIZE]u8 = {}  // Initialize all bytes to 0
 	metadata[0] = CMD_RF_SEND
 	metadata[1] = SUBCMD_LED_EFFECT
 	for i in 0..<6 {
@@ -455,11 +455,16 @@ build_led_effect_packets :: proc(
 	metadata[21] = u8((compressed_len >> 16) & 0xFF)
 	metadata[22] = u8((compressed_len >> 8) & 0xFF)
 	metadata[23] = u8(compressed_len & 0xFF)
+	metadata[24] = 0  // Reserved/unused - must be 0
 
 	// Total frames (big-endian)
 	metadata[25] = u8((total_frame >> 8) & 0xFF)
 	metadata[26] = u8(total_frame & 0xFF)
 	metadata[27] = led_count
+	metadata[28] = 0  // Reserved/unused - must be 0
+	metadata[29] = 0  // Reserved/unused - must be 0
+	metadata[30] = 0  // Reserved/unused - must be 0
+	metadata[31] = 0  // Reserved/unused - must be 0
 
 	// Set interval based on whether it's an animation or static
 	interval: u16 = total_frame > 1 ? 100 : 20
@@ -477,7 +482,7 @@ build_led_effect_packets :: proc(
 	// Data packets
 	offset := 0
 	for packet_idx in 1..=total_pk_num {
-		data_pkt: [RF_PACKET_SIZE]u8
+		data_pkt: [RF_PACKET_SIZE]u8 = {}  // Initialize all bytes to 0
 		data_pkt[0] = CMD_RF_SEND
 		data_pkt[1] = SUBCMD_LED_EFFECT
 		for i in 0..<6 {
@@ -635,7 +640,7 @@ set_led_effect :: proc(
 	defer delete(compressed, allocator)
 
 	compressed_size, result := tuz.compress_mem(rgb_data, compressed)
-	if result != .STREAM_END {
+	if result != .OK {
 		return .Compression_Failed
 	}
 

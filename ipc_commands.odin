@@ -45,6 +45,14 @@ Effect_Request :: struct {
 	color1:      [3]u8,
 	color2:      [3]u8,
 	brightness:  u8,
+	devices:     []Effect_Device_Info,
+}
+
+Effect_Device_Info :: struct {
+	mac_str:   string,
+	rx_type:   u8,
+	channel:   u8,
+	led_count: int,
 }
 
 Identify_Request :: struct {

@@ -1,0 +1,5 @@
+- We reverse engineered to LCD and LED protocol of the lian li SL 120 fans. We have fans connected that are SL 120 and SL 120 with LCD. We're creating a GTK app and its corrosponding service to keep configure the fans in userspace.
+- Use make build to build
+- Use make test to test
+- sl 120 looks like this https://lian-li.com/wp-content/uploads/2020/11/UNI-FAN-black-rgbx1-front.jpg
+- run build and test after every change

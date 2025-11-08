@@ -8,7 +8,7 @@ import "core:os"
 import "core:strings"
 import "core:strconv"
 
-import des "libs/des"
+// import des "libs/des"  // TODO: Enable when des library is available
 
 // USB Device IDs for Lian Li SL-LCD wired controller
 VID_WIRED :: 0x1cbe
@@ -120,18 +120,22 @@ generate_lcd_header :: proc(jpeg_size: u32, command: LCD_Command = .JPEG, alloca
 
 	// Bytes 12-503: zeros (already initialized)
 
+	// TODO: Enable DES encryption when des library is available
 	// Pad to 512 bytes using PKCS7
-	padded := des.pkcs7_pad(plaintext[:], des.DES_BLOCK_SIZE, allocator)
-	defer delete(padded, allocator)
+	// padded := des.pkcs7_pad(plaintext[:], des.DES_BLOCK_SIZE, allocator)
+	// defer delete(padded, allocator)
 
 	// Encrypt with DES-CBC
-	encrypted := make([]u8, len(padded), allocator)
-	defer delete(encrypted, allocator)
+	// encrypted := make([]u8, len(padded), allocator)
+	// defer delete(encrypted, allocator)
 
-	des.des_cbc_encrypt(padded, encrypted, DES_KEY[:], DES_IV[:])
+	// des.des_cbc_encrypt(padded, encrypted, DES_KEY[:], DES_IV[:])
 
 	// Copy to output header
-	copy(header[:], encrypted)
+	// copy(header[:], encrypted)
+
+	// Temporary: Return unencrypted header (padded with zeros to 512 bytes)
+	copy(header[:len(plaintext)], plaintext[:])
 
 	return header, true
 }
@@ -231,18 +235,22 @@ build_lcd_command :: proc(command: LCD_Command, value: u8 = 0, allocator := cont
 	// Byte 8: Command value (brightness level, rotation, etc.)
 	plaintext[8] = value
 
+	// TODO: Enable DES encryption when des library is available
 	// Pad to 512 bytes using PKCS7
-	padded := des.pkcs7_pad(plaintext[:], des.DES_BLOCK_SIZE, allocator)
-	defer delete(padded, allocator)
+	// padded := des.pkcs7_pad(plaintext[:], des.DES_BLOCK_SIZE, allocator)
+	// defer delete(padded, allocator)
 
 	// Encrypt with DES-CBC
-	encrypted := make([]u8, len(padded), allocator)
-	defer delete(encrypted, allocator)
+	// encrypted := make([]u8, len(padded), allocator)
+	// defer delete(encrypted, allocator)
 
-	des.des_cbc_encrypt(padded, encrypted, DES_KEY[:], DES_IV[:])
+	// des.des_cbc_encrypt(padded, encrypted, DES_KEY[:], DES_IV[:])
 
 	// Copy to output packet
-	copy(packet[:], encrypted)
+	// copy(packet[:], encrypted)
+
+	// Temporary: Return unencrypted packet (padded with zeros to 512 bytes)
+	copy(packet[:len(plaintext)], plaintext[:])
 
 	return packet, true
 }

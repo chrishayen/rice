@@ -1,16 +1,10 @@
 .PHONY: all build clean run run-server run-debug test help install
 
-BINARY := rice
-ODIN := odin
-PKG_CONFIG := pkg-config
+BINARY := zig-out/bin/rice
 
 # DES_KEY is required for LCD display encryption (must be exactly 8 bytes)
 # Set RICE_DES_KEY environment variable or override with: make build DES_KEY="yourkey8"
 DES_KEY ?= $(RICE_DES_KEY)
-
-ODIN_FLAGS := -o:speed
-LIBS := gtk4 libadwaita-1 cairo glib-2.0 gobject-2.0 libusb-1.0
-LINKER_FLAGS := $(shell $(PKG_CONFIG) --libs $(LIBS))
 
 all: build
 
@@ -27,9 +21,7 @@ ifeq ($(strip $(DES_KEY)),)
 endif
 	@echo "Building Fan Control Application..."
 	@echo ""
-	@echo "Building rice package..."
-	$(ODIN) build . -out:$(BINARY) $(ODIN_FLAGS) -define:DES_KEY="$(DES_KEY)" -extra-linker-flags:"$(LINKER_FLAGS)"
-	@echo "  ✓ rice ($$(du -h $(BINARY) | cut -f1))"
+	zig build -DDES_KEY="$(DES_KEY)"
 	@echo ""
 	@echo "Build complete!"
 	@echo ""
@@ -40,7 +32,8 @@ endif
 
 clean:
 	@echo "Cleaning build artifacts..."
-	rm -f $(BINARY)
+	rm -f rice
+	rm -rf zig-out .zig-cache libs/tinyuz/*.a
 	@echo "Done!"
 
 run: build
@@ -64,7 +57,7 @@ ifeq ($(strip $(DES_KEY)),)
 	@exit 1
 endif
 	@echo "Running all tests..."
-	$(ODIN) test . -all-packages $(ODIN_FLAGS) -define:DES_KEY="$(DES_KEY)" -extra-linker-flags:"$(LINKER_FLAGS)"
+	zig build test -DDES_KEY="$(DES_KEY)"
 
 install: build
 	@echo "Installing $(BINARY) to /usr/local/bin..."

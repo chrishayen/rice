@@ -57,11 +57,11 @@ AdwTabView :: distinct rawptr
 AdwTabBar :: distinct rawptr
 AdwTabPage :: distinct rawptr
 
-GdkRGBA :: struct {
-	red:   c.double,
-	green: c.double,
-	blue:  c.double,
-	alpha: c.double,
+GdkRGBA :: struct #packed {
+	red:   f32,
+	green: f32,
+	blue:  f32,
+	alpha: f32,
 }
 cairo_t :: distinct rawptr
 
@@ -302,6 +302,8 @@ App_State :: struct {
 	brightness_scale:      GtkScale,
 	color1_button:         GtkColorButton,
 	color2_button:         GtkColorButton,
+	color1_row:            GtkWidget, // Color picker row for primary color
+	color2_row:            GtkWidget, // Color picker row for secondary color
 	effect_dropdown:       GtkDropDown,
 	device_list_box:       GtkBox,
 	device_toggle_buttons: [dynamic]GtkToggleButton,
@@ -353,7 +355,7 @@ EFFECTS := [?]Effect_Info {
 	{"Alternating", "Two colors alternating", true, true},
 	{"Alternating Spin", "Rotating alternating pattern", true, true},
 	{"Rainbow Morph", "Morphing rainbow animation", false, false},
-	{"Breathing", "Fade in/out breathing effect", true, false},
+	{"Breathing", "Fade in/out breathing effect", false, false},
 	{"Runway", "Sequential runway animation", false, false},
 	{"Meteor", "Meteor trail animation", false, false},
 	{"Color Cycle", "Cycle through colors", false, false},
@@ -374,8 +376,8 @@ run_ui :: proc() {
 
 	// Initialize state
 	state.selected_effect = 0
-	state.color1 = {1.0, 0.0, 0.0, 1.0}
-	state.color2 = {0.0, 0.0, 1.0, 1.0}
+	state.color1 = GdkRGBA{red = 1.0, green = 0.0, blue = 0.0, alpha = 1.0}
+	state.color2 = GdkRGBA{red = 0.0, green = 0.0, blue = 1.0, alpha = 1.0}
 	state.brightness = 100.0
 	state.devices = make([dynamic]Device)
 	state.selected_devices = make([dynamic]bool)
@@ -579,6 +581,9 @@ build_effect_controls :: proc(state: ^App_State) -> GtkWidget {
 
 			selected := gtk_drop_down_get_selected(dropdown)
 			state.selected_effect = int(selected)
+
+			// Update visibility of options based on selected effect
+			update_effect_options_visibility(state)
 		}, nil, nil, 0)
 
 	// Color controls
@@ -587,20 +592,23 @@ build_effect_controls :: proc(state: ^App_State) -> GtkWidget {
 	gtk_box_append(auto_cast box, color_group)
 
 	// Color 1 row
-	color1_row := auto_cast adw_action_row_new()
-	adw_preferences_row_set_title(color1_row, "Primary Color")
+	state.color1_row = auto_cast adw_action_row_new()
+	adw_preferences_row_set_title(auto_cast state.color1_row, "Primary Color")
 	state.color1_button = auto_cast gtk_color_button_new()
 	gtk_color_chooser_set_rgba(state.color1_button, &state.color1)
-	adw_action_row_add_suffix(auto_cast color1_row, auto_cast state.color1_button)
-	adw_preferences_group_add(auto_cast color_group, color1_row)
+	adw_action_row_add_suffix(auto_cast state.color1_row, auto_cast state.color1_button)
+	adw_preferences_group_add(auto_cast color_group, state.color1_row)
 
 	// Color 2 row
-	color2_row := auto_cast adw_action_row_new()
-	adw_preferences_row_set_title(color2_row, "Secondary Color")
+	state.color2_row = auto_cast adw_action_row_new()
+	adw_preferences_row_set_title(auto_cast state.color2_row, "Secondary Color")
 	state.color2_button = auto_cast gtk_color_button_new()
 	gtk_color_chooser_set_rgba(state.color2_button, &state.color2)
-	adw_action_row_add_suffix(auto_cast color2_row, auto_cast state.color2_button)
-	adw_preferences_group_add(auto_cast color_group, color2_row)
+	adw_action_row_add_suffix(auto_cast state.color2_row, auto_cast state.color2_button)
+	adw_preferences_group_add(auto_cast color_group, state.color2_row)
+
+	// Set initial visibility based on default effect
+	update_effect_options_visibility(state)
 
 	// Brightness control
 	brightness_group := auto_cast adw_preferences_group_new()
@@ -1050,6 +1058,19 @@ on_refresh_clicked :: proc "c" (button: GtkButton, user_data: rawptr) {
 	fmt.printfln("Loaded %d devices from service", len(state.devices))
 }
 
+// Update visibility of effect options based on selected effect
+update_effect_options_visibility :: proc(state: ^App_State) {
+	if state.selected_effect < 0 || state.selected_effect >= len(EFFECTS) {
+		return
+	}
+
+	effect := EFFECTS[state.selected_effect]
+
+	// Show/hide color pickers based on effect requirements
+	gtk_widget_set_visible(state.color1_row, effect.has_color1)
+	gtk_widget_set_visible(state.color2_row, effect.has_color2)
+}
+
 on_preview_clicked :: proc "c" (button: GtkButton, user_data: rawptr) {
 	context = runtime.default_context()
 	state := cast(^App_State)user_data
@@ -1072,8 +1093,32 @@ on_apply_clicked :: proc "c" (button: GtkButton, user_data: rawptr) {
 	context = runtime.default_context()
 	state := cast(^App_State)user_data
 
-	fmt.printfln("Applying effect: %s", EFFECTS[state.selected_effect].name)
-	// TODO: Call Python sl_led
+	// Get current settings
+	effect_name := EFFECTS[state.selected_effect].name
+	state.brightness = gtk_range_get_value(state.brightness_scale)
+	gtk_color_chooser_get_rgba(state.color1_button, &state.color1)
+	gtk_color_chooser_get_rgba(state.color2_button, &state.color2)
+
+	// Get selected devices (only bound devices)
+	selected_devices := make([dynamic]Device, 0, len(state.devices))
+	defer delete(selected_devices)
+
+	for device, idx in state.devices {
+		if idx < len(state.selected_devices) && state.selected_devices[idx] && device.bound {
+			append(&selected_devices, device)
+		}
+	}
+
+	if len(selected_devices) == 0 {
+		log_warn("No bound devices selected to apply effect")
+		fmt.printfln("Please select at least one bound device")
+		return
+	}
+
+	fmt.printfln("Applying effect '%s' to %d device(s)", effect_name, len(selected_devices))
+
+	// Send effect request to service
+	send_effect_request(selected_devices[:], state.selected_effect, state.color1, state.color2, state.brightness)
 }
 
 // 3D view drag callbacks
@@ -1121,47 +1166,219 @@ generate_preview :: proc(state: ^App_State) {
 	delete(state.led_colors)
 	state.led_colors = make([dynamic][3]u8, total_leds)
 
-	// Generate based on effect
+	brightness := int(state.brightness)
+
+	// Generate based on effect using actual generator functions
+	rgb_data: []u8
+	defer delete(rgb_data)
+
 	switch state.selected_effect {
-	case 0:
-		// Static
-		r := u8(state.color1.red * 255 * state.brightness / 100)
-		g := u8(state.color1.green * 255 * state.brightness / 100)
-		b := u8(state.color1.blue * 255 * state.brightness / 100)
+	case 0: // Static Color
+		r := u8(f64(state.color1.red) * 255 * state.brightness / 100)
+		g := u8(f64(state.color1.green) * 255 * state.brightness / 100)
+		b := u8(f64(state.color1.blue) * 255 * state.brightness / 100)
+		rgb_data = generate_static_color(total_leds, r, g, b)
 
-		for i in 0 ..< total_leds {
-			state.led_colors[i] = {r, g, b}
-		}
+	case 1: // Rainbow
+		rgb_data = generate_rainbow(total_leds, brightness)
 
-	case 1:
-		// Rainbow
-		for i in 0 ..< total_leds {
-			hue := f32(i) / f32(total_leds)
-			r, g, b := hsv_to_rgb(hue, 1.0, f32(state.brightness / 100.0))
-			state.led_colors[i] = {r, g, b}
+	case 2: // Alternating
+		c1 := [3]u8{
+			u8(f64(state.color1.red) * 255 * state.brightness / 100),
+			u8(f64(state.color1.green) * 255 * state.brightness / 100),
+			u8(f64(state.color1.blue) * 255 * state.brightness / 100),
 		}
+		c2 := [3]u8{
+			u8(f64(state.color2.red) * 255 * state.brightness / 100),
+			u8(f64(state.color2.green) * 255 * state.brightness / 100),
+			u8(f64(state.color2.blue) * 255 * state.brightness / 100),
+		}
+		rgb_data = generate_alternating(total_leds, c1, c2)
 
-	case 2:
-		// Alternating
-		for i in 0 ..< total_leds {
-			if i % 2 == 0 {
-				r := u8(state.color1.red * 255 * state.brightness / 100)
-				g := u8(state.color1.green * 255 * state.brightness / 100)
-				b := u8(state.color1.blue * 255 * state.brightness / 100)
-				state.led_colors[i] = {r, g, b}
-			} else {
-				r := u8(state.color2.red * 255 * state.brightness / 100)
-				g := u8(state.color2.green * 255 * state.brightness / 100)
-				b := u8(state.color2.blue * 255 * state.brightness / 100)
-				state.led_colors[i] = {r, g, b}
-			}
+	case 3: // Alternating Spin (use frame 0)
+		c1 := [3]u8{
+			u8(f64(state.color1.red) * 255 * state.brightness / 100),
+			u8(f64(state.color1.green) * 255 * state.brightness / 100),
+			u8(f64(state.color1.blue) * 255 * state.brightness / 100),
 		}
+		c2 := [3]u8{
+			u8(f64(state.color2.red) * 255 * state.brightness / 100),
+			u8(f64(state.color2.green) * 255 * state.brightness / 100),
+			u8(f64(state.color2.blue) * 255 * state.brightness / 100),
+		}
+		full_data := generate_alternating_spin(total_leds, c1, c2, 60)
+		defer delete(full_data)
+		// Extract first frame
+		rgb_data = make([]u8, total_leds * 3)
+		copy(rgb_data, full_data[0:total_leds * 3])
+
+	case 4: // Rainbow Morph (use frame 0)
+		full_data := generate_rainbow_morph(total_leds, 127, brightness)
+		defer delete(full_data)
+		// Extract first frame
+		rgb_data = make([]u8, total_leds * 3)
+		copy(rgb_data, full_data[0:total_leds * 3])
+
+	case 5: // Breathing (use frame 0)
+		full_data := generate_breathing(total_leds, 680, brightness)
+		defer delete(full_data)
+		// Extract first frame
+		rgb_data = make([]u8, total_leds * 3)
+		copy(rgb_data, full_data[0:total_leds * 3])
+
+	case 6: // Runway (use frame 0)
+		full_data := generate_runway(total_leds, 180, brightness)
+		defer delete(full_data)
+		// Extract first frame
+		rgb_data = make([]u8, total_leds * 3)
+		copy(rgb_data, full_data[0:total_leds * 3])
+
+	case 7: // Meteor (use frame 0)
+		full_data := generate_meteor(total_leds, 360, brightness)
+		defer delete(full_data)
+		// Extract first frame
+		rgb_data = make([]u8, total_leds * 3)
+		copy(rgb_data, full_data[0:total_leds * 3])
+
+	case 8: // Color Cycle (use frame 0)
+		full_data := generate_color_cycle(total_leds, 40, brightness)
+		defer delete(full_data)
+		// Extract first frame
+		rgb_data = make([]u8, total_leds * 3)
+		copy(rgb_data, full_data[0:total_leds * 3])
+
+	case 9: // Wave (use frame 0)
+		full_data := generate_wave(total_leds, 80, brightness)
+		defer delete(full_data)
+		// Extract first frame
+		rgb_data = make([]u8, total_leds * 3)
+		copy(rgb_data, full_data[0:total_leds * 3])
+
+	case 10: // Meteor Shower (use frame 0)
+		full_data := generate_meteor_shower(total_leds, 80, brightness)
+		defer delete(full_data)
+		// Extract first frame
+		rgb_data = make([]u8, total_leds * 3)
+		copy(rgb_data, full_data[0:total_leds * 3])
+
+	case 11: // Twinkle (use frame 0)
+		full_data := generate_twinkle(total_leds, 200, brightness)
+		defer delete(full_data)
+		// Extract first frame
+		rgb_data = make([]u8, total_leds * 3)
+		copy(rgb_data, full_data[0:total_leds * 3])
 
 	case:
 		// Default to dim
-		for i in 0 ..< total_leds {
-			state.led_colors[i] = {26, 26, 26}
+		rgb_data = generate_static_color(total_leds, 26, 26, 26)
+	}
+
+	// Convert flat RGB array to [dynamic][3]u8
+	for i in 0 ..< total_leds {
+		state.led_colors[i] = {
+			rgb_data[i * 3],
+			rgb_data[i * 3 + 1],
+			rgb_data[i * 3 + 2],
 		}
+	}
+}
+
+// Send effect request to service
+send_effect_request :: proc(devices: []Device, effect_idx: int, color1: GdkRGBA, color2: GdkRGBA, brightness: f64) {
+	if len(devices) == 0 do return
+
+	// Get socket path
+	socket_path, path_err := get_socket_path()
+	defer delete(socket_path)
+
+	if path_err != .None {
+		log_warn("Failed to get socket path: %v", path_err)
+		return
+	}
+
+	// Connect to service
+	client, connect_err := connect_to_server(socket_path)
+	defer close_client(&client)
+
+	if connect_err != .None {
+		log_warn("Failed to connect to service: %v (is service running?)", connect_err)
+		fmt.printfln("Error: Could not connect to service. Is the service running?")
+		return
+	}
+
+	// Build effect request
+	device_infos := make([dynamic]Effect_Device_Info, 0, len(devices))
+	defer delete(device_infos)
+
+	for device in devices {
+		append(&device_infos, Effect_Device_Info{
+			mac_str = device.mac_str,
+			rx_type = device.rx_type,
+			channel = device.channel,
+			led_count = device.led_count,
+		})
+	}
+
+	// Convert colors to u8
+	// For Static Color, Alternating, and Alternating Spin, apply brightness to the colors
+	// (Python's generate_static_color doesn't take brightness parameter)
+	brightness_factor := (effect_idx == 0 || effect_idx == 2 || effect_idx == 3) ? brightness / 100.0 : 1.0
+
+	c1 := [3]u8{
+		u8(f64(color1.red) * 255 * brightness_factor),
+		u8(f64(color1.green) * 255 * brightness_factor),
+		u8(f64(color1.blue) * 255 * brightness_factor),
+	}
+	c2 := [3]u8{
+		u8(f64(color2.red) * 255 * brightness_factor),
+		u8(f64(color2.green) * 255 * brightness_factor),
+		u8(f64(color2.blue) * 255 * brightness_factor),
+	}
+
+	effect_req := Effect_Request{
+		effect_name = EFFECTS[effect_idx].name,
+		color1 = c1,
+		color2 = c2,
+		brightness = u8(brightness),
+		devices = device_infos[:],
+	}
+
+	// Marshal to JSON
+	json_data, marshal_err := json.marshal(effect_req)
+	if marshal_err != nil {
+		log_warn("Failed to marshal effect request: %v", marshal_err)
+		return
+	}
+	defer delete(json_data)
+
+	// Send Set_Effect request
+	request := IPC_Message{
+		type = .Set_Effect,
+		payload = string(json_data),
+	}
+
+	send_err := send_message(client.socket_fd, request)
+	if send_err != .None {
+		log_warn("Failed to send Set_Effect request: %v", send_err)
+		return
+	}
+
+	log_debug("Effect request sent for %d device(s), waiting for response...", len(devices))
+
+	// Wait for success response
+	response, recv_err := receive_message(client.socket_fd)
+	if recv_err != .None {
+		log_warn("Failed to receive Effect_Applied response: %v", recv_err)
+		return
+	}
+	defer delete(response.payload)
+
+	if response.type == .Effect_Applied {
+		log_info("Effect applied successfully to %d device(s)", len(devices))
+		fmt.printfln("Effect applied successfully!")
+	} else {
+		log_warn("Unexpected response type: %v", response.type)
+		fmt.printfln("Error: Unexpected response from service")
 	}
 }
 

@@ -11,6 +11,15 @@ import "core:strings"
 import "core:sync"
 import "core:thread"
 import "core:time"
+import tuz "libs/tinyuz"
+
+Device_Packet_Info :: struct {
+	channel:     u8,
+	rx_type:     u8,
+	mac_str:     string,  // Deep copied for logging
+	rf_packets:  [][240]u8,
+	total_frame: u16,
+}
 
 Service_State :: struct {
 	led_device:            LED_Device,
@@ -21,7 +30,11 @@ Service_State :: struct {
 	devices_mutex:         sync.Mutex,
 	master_poll_thread:    ^thread.Thread,
 	device_query_thread:   ^thread.Thread,
+	effect_broadcast_thread: ^thread.Thread,
 	epoll_fd:              c.int,
+	// Current effect packets for continuous broadcast
+	current_effect_packets: [dynamic]Device_Packet_Info,
+	effect_packets_mutex:  sync.Mutex,
 }
 
 run_service :: proc() {
@@ -125,6 +138,10 @@ run_service :: proc() {
 	log_debug("Starting device query thread...")
 	state.device_query_thread = thread.create_and_start_with_data(&state, device_query_thread)
 
+	// Start effect broadcast thread
+	log_debug("Starting effect broadcast thread...")
+	state.effect_broadcast_thread = thread.create_and_start_with_data(&state, effect_broadcast_thread)
+
 	log_info("Service initialized successfully")
 	log_info("Press Ctrl+C to stop")
 	log_debug("Poll interval: %d seconds", state.poll_interval_seconds)
@@ -170,6 +187,9 @@ run_service :: proc() {
 	}
 	if state.device_query_thread != nil {
 		thread.destroy(state.device_query_thread)
+	}
+	if state.effect_broadcast_thread != nil {
+		thread.destroy(state.effect_broadcast_thread)
 	}
 }
 
@@ -365,6 +385,73 @@ device_query_thread :: proc(data: rawptr) {
 	}
 
 	log_debug("Device query thread stopped")
+}
+
+// Effect broadcast thread - continuously sends current effect (like L-Connect)
+effect_broadcast_thread :: proc(data: rawptr) {
+	state := cast(^Service_State)data
+
+	log_debug("Effect broadcast thread started")
+
+	iteration := 0
+	for state.running {
+		// Get current effect packets (with mutex)
+		sync.lock(&state.effect_packets_mutex)
+		has_packets := len(state.current_effect_packets) > 0
+
+		if has_packets {
+			// Make a copy of packets to send
+			packets_to_send := make([dynamic]Device_Packet_Info, len(state.current_effect_packets))
+			defer delete(packets_to_send)
+
+			for dp, i in state.current_effect_packets {
+				// Deep copy packets
+				rf_packets_copy := make([][240]u8, len(dp.rf_packets))
+				for pkt, j in dp.rf_packets {
+					rf_packets_copy[j] = pkt
+				}
+
+				packets_to_send[i] = Device_Packet_Info{
+					channel = dp.channel,
+					rx_type = dp.rx_type,
+					mac_str = strings.clone(dp.mac_str),  // Deep copy string
+					rf_packets = rf_packets_copy,
+					total_frame = dp.total_frame,
+				}
+			}
+			sync.unlock(&state.effect_packets_mutex)
+
+			// Send packets to all devices
+			for &dp in packets_to_send {
+				// Send metadata packet 4 times with 20ms delays
+				for _ in 0..<4 {
+					send_rf_packet(&state.led_device, dp.rf_packets[0][:], dp.channel, dp.rx_type, delay_ms = 0.5)
+					time.sleep(20 * time.Millisecond)
+				}
+
+				// Send data packets once each
+				for &data_packet in dp.rf_packets[1:] {
+					send_rf_packet(&state.led_device, data_packet[:], dp.channel, dp.rx_type, delay_ms = 0.5)
+				}
+
+				// Clean up deep copied data
+				delete(dp.mac_str)
+				delete(dp.rf_packets)
+			}
+
+			iteration += 1
+			if iteration % 10 == 0 {
+				log_debug("Effect broadcast: sent %d iterations", iteration)
+			}
+		} else {
+			sync.unlock(&state.effect_packets_mutex)
+		}
+
+		// Sleep 100ms between iterations (matches Python line 1881)
+		time.sleep(100 * time.Millisecond)
+	}
+
+	log_debug("Effect broadcast thread stopped")
 }
 
 // Handle socket message from client
@@ -731,6 +818,222 @@ handle_socket_message :: proc(client_fd: c.int, state: ^Service_State) {
 		send_err := send_message(client_fd, response)
 		if send_err != .None {
 			log_warn("Failed to send Unbind_Success response: %v", send_err)
+		}
+
+	case .Set_Effect:
+		log_debug("Handling Set_Effect request")
+
+		// Parse effect request from JSON
+		effect_req: Effect_Request
+		payload_bytes := transmute([]u8)msg.payload
+		unmarshal_err := json.unmarshal(payload_bytes, &effect_req)
+		if unmarshal_err != nil {
+			log_warn("Failed to unmarshal effect request: %v", unmarshal_err)
+			return
+		}
+		defer delete(effect_req.devices)
+
+		log_info("Applying effect '%s' to %d device(s)", effect_req.effect_name, len(effect_req.devices))
+
+		// Prepare packets for all devices (first loop - matches Python lines 1704-1821)
+		device_packets := make([dynamic]Device_Packet_Info)
+		// Note: device_packets ownership is transferred to state.current_effect_packets, so no defer delete
+
+		brightness := int(effect_req.brightness)
+
+		for device_info in effect_req.devices {
+			log_info(
+				"Preparing effect for device: %s (rx_type=%d, channel=%d, led_count=%d)",
+				device_info.mac_str,
+				device_info.rx_type,
+				device_info.channel,
+				device_info.led_count,
+			)
+
+			// Find device in cache to get full RF_Device_Info
+			sync.mutex_lock(&state.devices_mutex)
+			device_rf_info: RF_Device_Info
+			device_found := false
+			for cached_device in state.devices_cache {
+				if cached_device.mac_str == device_info.mac_str {
+					device_rf_info = cached_device
+					device_found = true
+					break
+				}
+			}
+			sync.mutex_unlock(&state.devices_mutex)
+
+			if !device_found {
+				log_warn("Device %s not found in cache", device_info.mac_str)
+				continue
+			}
+
+			// Calculate total LEDs based on fan_types (matches Python line 1725-1726)
+			leds_per_fan: int = 40
+			for fan_type in device_rf_info.fan_types {
+				if fan_type >= 28 {
+					leds_per_fan = 26
+					break
+				}
+			}
+			total_leds := leds_per_fan * int(device_rf_info.fan_num)
+
+			log_info("  Device %s: %d fans, %d LEDs", device_info.mac_str, device_rf_info.fan_num, total_leds)
+
+			// Generate effect data based on effect name
+			rgb_data: []u8
+			defer delete(rgb_data)
+
+			switch effect_req.effect_name {
+			case "Static Color":
+				rgb_data = generate_static_color(total_leds, effect_req.color1[0], effect_req.color1[1], effect_req.color1[2])
+
+			case "Rainbow":
+				rgb_data = generate_rainbow(total_leds, brightness)
+
+			case "Alternating":
+				rgb_data = generate_alternating(total_leds, effect_req.color1, effect_req.color2)
+
+			case "Alternating Spin":
+				rgb_data = generate_alternating_spin(total_leds, effect_req.color1, effect_req.color2, 60)
+
+			case "Rainbow Morph":
+				rgb_data = generate_rainbow_morph(total_leds, 127, brightness)
+
+			case "Breathing":
+				rgb_data = generate_breathing(total_leds, 680, brightness)
+
+			case "Runway":
+				rgb_data = generate_runway(total_leds, 180, brightness)
+
+			case "Meteor":
+				rgb_data = generate_meteor(total_leds, 360, brightness)
+
+			case "Color Cycle":
+				rgb_data = generate_color_cycle(total_leds, 40, brightness)
+
+			case "Wave":
+				rgb_data = generate_wave(total_leds, 80, brightness)
+
+			case "Meteor Shower":
+				rgb_data = generate_meteor_shower(total_leds, 80, brightness)
+
+			case "Twinkle":
+				rgb_data = generate_twinkle(total_leds, 200, brightness)
+
+			case:
+				log_warn("Unknown effect: %s", effect_req.effect_name)
+				continue
+			}
+
+			// Calculate total frames for animated effects
+			total_frames: u16 = 1
+			switch effect_req.effect_name {
+			case "Alternating Spin":
+				total_frames = 60
+			case "Rainbow Morph":
+				total_frames = 127
+			case "Breathing":
+				total_frames = 680
+			case "Runway":
+				total_frames = 180
+			case "Meteor":
+				total_frames = 360
+			case "Color Cycle":
+				total_frames = 40
+			case "Wave":
+				total_frames = 80
+			case "Meteor Shower":
+				total_frames = 80
+			case "Twinkle":
+				total_frames = 200
+			}
+
+			// Compress and build packets
+			compressed := make([]u8, len(rgb_data) * 2)
+			defer delete(compressed)
+
+			compressed_size, compress_result := tuz.compress_mem(rgb_data, compressed)
+			if compress_result != .OK {
+				log_warn("Failed to compress RGB data for device %s", device_info.mac_str)
+				continue
+			}
+
+			rf_packets, err := build_led_effect_packets(
+				compressed[:compressed_size],
+				u8(total_leds),
+				device_rf_info.mac,
+				state.led_device.master_mac,
+				total_frames,
+			)
+			if err != .None {
+				log_warn("Failed to build packets for device %s: %v", device_info.mac_str, err)
+				continue
+			}
+
+			append(&device_packets, Device_Packet_Info{
+				channel = device_rf_info.channel,
+				rx_type = device_rf_info.rx_type,
+				mac_str = strings.clone(device_rf_info.mac_str),  // Deep copy to avoid dangling pointer
+				rf_packets = rf_packets,
+				total_frame = total_frames,
+			})
+
+			log_info("Built %d packets for device %s (total_frame=%d)", len(rf_packets), device_info.mac_str, total_frames)
+		}
+
+		// Send effect to all devices (second loop - matches Python lines 1827-1838)
+		log_info("Sending effect to %d device(s)...", len(device_packets))
+		success_count := 0
+
+		for &dp in device_packets {
+			// Send metadata packet 4 times with 20ms delays
+			for _ in 0..<4 {
+				send_err := send_rf_packet(&state.led_device, dp.rf_packets[0][:], dp.channel, dp.rx_type, delay_ms = 0.5)
+				if send_err != .None {
+					log_warn("Failed to send metadata packet to device %s: %v", dp.mac_str, send_err)
+					break
+				}
+				time.sleep(20 * time.Millisecond)
+			}
+
+			// Send data packets once each
+			for &data_packet in dp.rf_packets[1:] {
+				send_err := send_rf_packet(&state.led_device, data_packet[:], dp.channel, dp.rx_type, delay_ms = 0.5)
+				if send_err != .None {
+					log_warn("Failed to send data packet to device %s: %v", dp.mac_str, send_err)
+					break
+				}
+			}
+
+			log_info("Effect sent to device %s", dp.mac_str)
+			success_count += 1
+		}
+
+		// Store packets for continuous broadcast (matches Python lines 1857-1881)
+		log_info("Storing effect packets for continuous broadcast...")
+		sync.lock(&state.effect_packets_mutex)
+
+		// Clear old packets
+		for &old_dp in state.current_effect_packets {
+			delete(old_dp.mac_str)  // Free cloned string
+			delete(old_dp.rf_packets)
+		}
+		delete(state.current_effect_packets)
+
+		// Store new packets
+		state.current_effect_packets = device_packets
+		sync.unlock(&state.effect_packets_mutex)
+
+		// Send success response
+		response := IPC_Message {
+			type    = .Effect_Applied,
+			payload = fmt.tprintf("%d", success_count),
+		}
+
+		send_err := send_message(client_fd, response)
+		if send_err != .None {
+			log_warn("Failed to send Effect_Applied response: %v", send_err)
 		}
 
 	case .Ping:
