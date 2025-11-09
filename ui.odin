@@ -10,7 +10,11 @@ import "core:encoding/json"
 import "core:fmt"
 import "core:math"
 import "core:mem"
+import "core:os"
+import "core:path/filepath"
+import "core:slice"
 import "core:strings"
+import stbi "vendor:stb/image"
 
 // GTK4 + libadwaita bindings
 foreign import gtk "system:gtk-4"
@@ -65,6 +69,17 @@ GdkRGBA :: struct #packed {
 	alpha: f32,
 }
 cairo_t :: distinct rawptr
+cairo_surface_t :: distinct rawptr
+
+cairo_format_t :: enum c.int {
+	INVALID   = -1,
+	ARGB32    = 0,
+	RGB24     = 1,
+	A8        = 2,
+	A1        = 3,
+	RGB16_565 = 4,
+	RGB30     = 5,
+}
 
 GtkOrientation :: enum c.int {
 	HORIZONTAL = 0,
@@ -277,9 +292,15 @@ foreign cairo {
 	cairo_text_extents :: proc(cr: cairo_t, text: cstring, extents: ^cairo_text_extents_t) ---
 	cairo_save :: proc(cr: cairo_t) ---
 	cairo_restore :: proc(cr: cairo_t) ---
+	cairo_clip :: proc(cr: cairo_t) ---
 	cairo_translate :: proc(cr: cairo_t, tx, ty: c.double) ---
 	cairo_rotate :: proc(cr: cairo_t, angle: c.double) ---
 	cairo_scale :: proc(cr: cairo_t, sx, sy: c.double) ---
+
+	// Surface functions
+	cairo_image_surface_create_for_data :: proc(data: rawptr, format: cairo_format_t, width, height, stride: c.int) -> cairo_surface_t ---
+	cairo_surface_destroy :: proc(surface: cairo_surface_t) ---
+	cairo_set_source_surface :: proc(cr: cairo_t, surface: cairo_surface_t, x, y: c.double) ---
 }
 
 cairo_text_extents_t :: struct {
@@ -337,6 +358,20 @@ App_State :: struct {
 	selected_lcd_device:   int,  // Index into devices array, -1 if none selected
 	selected_lcd_fan:      int,  // Fan index within the device, -1 if none selected
 	usb_lcd_devices:       [dynamic]USB_LCD_Device,  // USB LCD devices indexed by rx_type
+
+	// LCD preview rendering
+	lcd_raylib_processor:   LCD_Raylib_Processor,  // Raylib processor for preview
+	lcd_preview_surface:    cairo_surface_t,        // Cairo surface for rendering to GTK
+	lcd_preview_frame:      []u8,                   // Current preview frame (JPEG data)
+	lcd_preview_transform:  LCD_Transform,          // Current transform settings
+
+	// LCD preview playback
+	lcd_preview_frames_dir: string,                 // Directory containing preview frames
+	lcd_preview_frame_list: [dynamic]string,        // List of frame file paths
+	lcd_preview_frame_idx:  int,                    // Current frame index
+	lcd_preview_timer_id:   c.uint,                 // GTK timer ID for playback
+	lcd_preview_playing:    bool,                   // Whether preview is playing
+	lcd_preview_fps:        f32,                    // Playback FPS
 }
 
 Device :: struct {
@@ -422,6 +457,15 @@ run_ui :: proc() {
 		state.model_loaded = false
 	}
 
+	// Initialize raylib processor for LCD preview
+	lcd_processor, lcd_ok := init_lcd_raylib_processor(LCD_WIDTH, LCD_HEIGHT)
+	if lcd_ok {
+		state.lcd_raylib_processor = lcd_processor
+		fmt.println("LCD raylib processor initialized for preview")
+	} else {
+		fmt.println("Warning: Failed to initialize raylib processor for LCD preview")
+	}
+
 	// Create Adwaita application
 	app := adw_application_new("dev.shotgun.rice", 0)
 	g_signal_connect_data(app, "activate", auto_cast on_activate, state, nil, 0)
@@ -435,6 +479,25 @@ run_ui :: proc() {
 	delete(state.device_toggle_buttons)
 	if state.model_loaded {
 		free_model(&state.model)
+	}
+	if state.lcd_raylib_processor.initialized {
+		cleanup_lcd_raylib_processor(&state.lcd_raylib_processor)
+	}
+	if state.lcd_preview_frame != nil {
+		delete(state.lcd_preview_frame)
+	}
+	if state.lcd_preview_surface != nil {
+		cairo_surface_destroy(state.lcd_preview_surface)
+	}
+	// Stop preview playback
+	stop_lcd_preview_playback(state)
+	// Cleanup preview frame list
+	for path in state.lcd_preview_frame_list {
+		delete(path)
+	}
+	delete(state.lcd_preview_frame_list)
+	if state.lcd_preview_frames_dir != "" {
+		delete(state.lcd_preview_frames_dir)
 	}
 }
 
@@ -745,13 +808,20 @@ build_lcd_preview_panel :: proc(state: ^App_State) -> GtkWidget {
 
 	// Frame for preview
 	frame := auto_cast gtk_frame_new(nil)
-	gtk_widget_set_vexpand(frame, true)
+	gtk_widget_set_size_request(frame, 400, 400)  // Fixed 400x400 size
+	gtk_widget_set_vexpand(frame, false)
+	gtk_widget_set_hexpand(frame, false)
+	gtk_widget_set_halign(frame, .CENTER)
+	gtk_widget_set_valign(frame, .START)
 	gtk_box_append(auto_cast box, frame)
 
 	// Drawing area for LCD preview (400x400 to match actual LCD resolution)
 	state.lcd_preview_area = auto_cast gtk_drawing_area_new()
 	gtk_drawing_area_set_content_width(state.lcd_preview_area, 400)
 	gtk_drawing_area_set_content_height(state.lcd_preview_area, 400)
+	gtk_widget_set_size_request(auto_cast state.lcd_preview_area, 400, 400)
+	gtk_widget_set_hexpand(auto_cast state.lcd_preview_area, false)
+	gtk_widget_set_vexpand(auto_cast state.lcd_preview_area, false)
 	gtk_drawing_area_set_draw_func(state.lcd_preview_area, draw_lcd_preview, state, nil)
 	gtk_frame_set_child(auto_cast frame, auto_cast state.lcd_preview_area)
 
@@ -1000,73 +1070,101 @@ draw_lcd_preview :: proc "c" (
 	context = runtime.default_context()
 
 	state := cast(^App_State)user_data
+	extents: cairo_text_extents_t
 
-	// Background - dark to simulate LCD screen
-	cairo_set_source_rgb(cr, 0.05, 0.05, 0.05)
+	// Fixed LCD display dimensions
+	LCD_SIZE :: 400.0
+	center_x := LCD_SIZE / 2.0
+	center_y := LCD_SIZE / 2.0
+	radius := LCD_SIZE / 2.0
+
+	// Clear background
+	cairo_set_source_rgb(cr, 0.0, 0.0, 0.0)
 	cairo_paint(cr)
 
-	// Determine state and show appropriate message
-	text: cstring
-	subtitle: cstring = nil
+	// If we have a preview frame and raylib processor, draw it
+	if state.lcd_preview_frame != nil && state.lcd_raylib_processor.initialized && state.lcd_preview_surface != nil {
+		// Draw black circular background for LCD
+		cairo_arc(cr, center_x, center_y, radius, 0, 2 * 3.14159265359)
+		cairo_set_source_rgb(cr, 0.05, 0.05, 0.05)
+		cairo_fill(cr)
 
-	// Check if we have any devices loaded
-	if len(state.devices) == 0 {
-		// State 1: No devices loaded yet
-		text = "No devices detected"
-		subtitle = "Click 'Refresh Devices' to scan for fans"
-		cairo_set_source_rgb(cr, 0.6, 0.4, 0.4)  // Reddish tint
+		// Save cairo state for clipping
+		cairo_save(cr)
+
+		// Create circular clipping path
+		cairo_arc(cr, center_x, center_y, radius, 0, 2 * 3.14159265359)
+		cairo_clip(cr)
+
+		// Draw the cached surface
+		cairo_set_source_surface(cr, state.lcd_preview_surface, 0, 0)
+		cairo_paint(cr)
+
+		// Restore cairo state
+		cairo_restore(cr)
 	} else {
-		// Check if we have any LCD fans available
-		has_lcd_fans := false
-		for device in state.devices {
-			if device.has_lcd {
-				has_lcd_fans = true
-				break
+		// No preview - show status message
+		text: cstring
+		subtitle: cstring = nil
+
+		// Check if we have any devices loaded
+		if len(state.devices) == 0 {
+			// State 1: No devices loaded yet
+			text = "No devices detected"
+			subtitle = "Click 'Refresh Devices' to scan for fans"
+			cairo_set_source_rgb(cr, 0.6, 0.4, 0.4)  // Reddish tint
+		} else {
+			// Check if we have any LCD fans available
+			has_lcd_fans := false
+			for device in state.devices {
+				if device.has_lcd {
+					has_lcd_fans = true
+					break
+				}
+			}
+
+			if !has_lcd_fans {
+				// State 2: Devices loaded but none have LCD
+				text = "No LCD fans available"
+				subtitle = "Connect SL 120 LCD fans to use this feature"
+				cairo_set_source_rgb(cr, 0.6, 0.5, 0.3)  // Yellowish tint
+			} else if state.selected_lcd_device == -1 {
+				// State 3: LCD fans available but none selected
+				text = "No LCD fan selected"
+				subtitle = "Choose a fan from the dropdown above"
+				cairo_set_source_rgb(cr, 0.5, 0.5, 0.5)  // Gray
+			} else {
+				// State 4: LCD fan selected, ready for video
+				text = "Ready to play"
+				subtitle = "Select a video source and click Play"
+				cairo_set_source_rgb(cr, 0.3, 0.6, 0.3)  // Greenish tint
 			}
 		}
 
-		if !has_lcd_fans {
-			// State 2: Devices loaded but none have LCD
-			text = "No LCD fans available"
-			subtitle = "Connect SL 120 LCD fans to use this feature"
-			cairo_set_source_rgb(cr, 0.6, 0.5, 0.3)  // Yellowish tint
-		} else if state.selected_lcd_device == -1 {
-			// State 3: LCD fans available but none selected
-			text = "No LCD fan selected"
-			subtitle = "Choose a fan from the dropdown above"
-			cairo_set_source_rgb(cr, 0.5, 0.5, 0.5)  // Gray
-		} else {
-			// State 4: LCD fan selected, ready for video
-			text = "Ready to play"
-			subtitle = "Select a video source and click Play"
-			cairo_set_source_rgb(cr, 0.3, 0.6, 0.3)  // Greenish tint
+		// Draw main message
+		cairo_select_font_face(cr, "Inter", 0, 0)
+		cairo_set_font_size(cr, 16)
+
+		cairo_text_extents(cr, text, &extents)
+
+		x := (c.double(width) - extents.width) / 2
+		y := c.double(height) / 2 - 10
+
+		cairo_move_to(cr, x, y)
+		cairo_show_text(cr, text)
+
+		// Draw subtitle if present
+		if subtitle != nil {
+			cairo_set_font_size(cr, 12)
+			cairo_set_source_rgb(cr, 0.4, 0.4, 0.4)
+
+			cairo_text_extents(cr, subtitle, &extents)
+			sub_x := (c.double(width) - extents.width) / 2
+			sub_y := c.double(height) / 2 + 15
+
+			cairo_move_to(cr, sub_x, sub_y)
+			cairo_show_text(cr, subtitle)
 		}
-	}
-
-	// Draw main message
-	cairo_select_font_face(cr, "Inter", 0, 0)
-	cairo_set_font_size(cr, 16)
-
-	extents: cairo_text_extents_t
-	cairo_text_extents(cr, text, &extents)
-
-	x := (c.double(width) - extents.width) / 2
-	y := c.double(height) / 2 - 10
-
-	cairo_move_to(cr, x, y)
-	cairo_show_text(cr, text)
-
-	// Draw subtitle if present
-	if subtitle != nil {
-		cairo_set_font_size(cr, 12)
-		cairo_set_source_rgb(cr, 0.4, 0.4, 0.4)
-
-		cairo_text_extents(cr, subtitle, &extents)
-		sub_x := (c.double(width) - extents.width) / 2
-		sub_y := c.double(height) / 2 + 15
-
-		cairo_move_to(cr, sub_x, sub_y)
-		cairo_show_text(cr, subtitle)
 	}
 
 	// If a fan is selected, show device info at top
@@ -1108,6 +1206,196 @@ draw_lcd_preview :: proc "c" (
 	cairo_line_to(cr, 0, c.double(height))
 	cairo_close_path(cr)
 	cairo_stroke(cr)
+}
+
+// Load LCD preview from saved configuration
+load_lcd_preview_from_config :: proc(state: ^App_State, settings: App_Settings) {
+	// Set transform to defaults
+	state.lcd_preview_transform = LCD_Transform{}
+
+	// Try to load frames from config directory
+	config_dir, err := get_config_dir()
+	if err != .None do return
+	defer delete(config_dir)
+
+	frames_dir := fmt.aprintf("%s/lcd_frames/bad_apple", config_dir)
+	defer delete(frames_dir)
+
+	// Load frame list
+	if load_preview_frames_list(state, frames_dir) {
+		// Start playback at 20 FPS
+		start_lcd_preview_playback(state, 20.0)
+	}
+}
+
+// Update LCD preview with a new frame and transform
+update_lcd_preview :: proc(state: ^App_State, jpeg_data: []u8, transform: LCD_Transform) {
+	if !state.lcd_raylib_processor.initialized do return
+
+	// Process frame with raylib
+	processed, ok := process_lcd_frame_raylib(
+		&state.lcd_raylib_processor,
+		jpeg_data,
+		transform,
+		0, // frame number (not animated in preview)
+	)
+	if !ok do return
+	defer delete(processed)
+
+	// Decode processed JPEG to create Cairo surface
+	width, height, channels: c.int
+	pixels := stbi.load_from_memory(
+		raw_data(processed),
+		c.int(len(processed)),
+		&width,
+		&height,
+		&channels,
+		4, // Force RGBA
+	)
+	if pixels == nil do return
+	defer stbi.image_free(pixels)
+
+	// Convert RGBA to Cairo's ARGB32 format (BGRA byte order on little-endian)
+	pixel_data := ([^]u8)(pixels)[:width * height * 4]
+	cairo_data := make([]u8, width * height * 4)
+
+	for i in 0..<(width * height) {
+		r := pixel_data[i*4 + 0]
+		g := pixel_data[i*4 + 1]
+		b := pixel_data[i*4 + 2]
+		a := pixel_data[i*4 + 3]
+
+		// Cairo ARGB32 format is actually BGRA in memory on little-endian
+		// Premultiply alpha
+		af := f32(a) / 255.0
+		cairo_data[i*4 + 0] = u8(f32(b) * af)  // B
+		cairo_data[i*4 + 1] = u8(f32(g) * af)  // G
+		cairo_data[i*4 + 2] = u8(f32(r) * af)  // R
+		cairo_data[i*4 + 3] = a                 // A
+	}
+
+	// Create Cairo surface from pixel data
+	if state.lcd_preview_surface != nil {
+		cairo_surface_destroy(state.lcd_preview_surface)
+	}
+
+	state.lcd_preview_surface = cairo_image_surface_create_for_data(
+		raw_data(cairo_data),
+		.ARGB32,
+		width,
+		height,
+		width * 4, // stride
+	)
+
+	// Store the frame and cairo data
+	if state.lcd_preview_frame != nil {
+		delete(state.lcd_preview_frame)
+	}
+	state.lcd_preview_frame = cairo_data
+	state.lcd_preview_transform = transform
+
+	// Redraw preview
+	if state.lcd_preview_area != nil {
+		gtk_widget_queue_draw(auto_cast state.lcd_preview_area)
+	}
+}
+
+// Load list of preview frames from directory
+load_preview_frames_list :: proc(state: ^App_State, frames_dir: string) -> bool {
+	// Clear existing frame list
+	for path in state.lcd_preview_frame_list {
+		delete(path)
+	}
+	clear(&state.lcd_preview_frame_list)
+
+	// Store directory
+	if state.lcd_preview_frames_dir != "" {
+		delete(state.lcd_preview_frames_dir)
+	}
+	state.lcd_preview_frames_dir = strings.clone(frames_dir)
+
+	// Read directory
+	dir_handle, err := os.open(frames_dir)
+	if err != os.ERROR_NONE do return false
+	defer os.close(dir_handle)
+
+	file_infos, read_err := os.read_dir(dir_handle, -1)
+	if read_err != os.ERROR_NONE do return false
+	defer delete(file_infos)
+
+	// Collect JPEG files
+	for info in file_infos {
+		if info.is_dir do continue
+
+		ext := filepath.ext(info.name)
+		if ext != ".jpg" && ext != ".jpeg" do continue
+
+		full_path := filepath.join({frames_dir, info.name})
+		append(&state.lcd_preview_frame_list, full_path)
+	}
+
+	// Sort alphabetically
+	slice.sort(state.lcd_preview_frame_list[:])
+
+	return len(state.lcd_preview_frame_list) > 0
+}
+
+// Timer callback for preview playback
+lcd_preview_timer_callback :: proc "c" (user_data: rawptr) -> c.bool {
+	context = runtime.default_context()
+	state := cast(^App_State)user_data
+
+	if !state.lcd_preview_playing || len(state.lcd_preview_frame_list) == 0 {
+		return false // Stop timer
+	}
+
+	// Load current frame
+	frame_path := state.lcd_preview_frame_list[state.lcd_preview_frame_idx]
+	frame_data, ok := os.read_entire_file(frame_path)
+	if ok {
+		update_lcd_preview(state, frame_data, state.lcd_preview_transform)
+		delete(frame_data)
+	}
+
+	// Advance to next frame (loop back to start)
+	state.lcd_preview_frame_idx += 1
+	if state.lcd_preview_frame_idx >= len(state.lcd_preview_frame_list) {
+		state.lcd_preview_frame_idx = 0
+	}
+
+	return true // Continue timer
+}
+
+// Start LCD preview playback
+start_lcd_preview_playback :: proc(state: ^App_State, fps: f32 = 20.0) {
+	if state.lcd_preview_playing do return
+	if len(state.lcd_preview_frame_list) == 0 do return
+
+	state.lcd_preview_playing = true
+	state.lcd_preview_fps = fps
+	state.lcd_preview_frame_idx = 0
+
+	// Calculate interval in milliseconds
+	interval := c.uint(1000.0 / fps)
+
+	// Start timer
+	state.lcd_preview_timer_id = g_timeout_add(interval, auto_cast lcd_preview_timer_callback, state)
+}
+
+// Stop LCD preview playback
+stop_lcd_preview_playback :: proc(state: ^App_State) {
+	if !state.lcd_preview_playing do return
+
+	state.lcd_preview_playing = false
+
+	// Remove timer
+	if state.lcd_preview_timer_id != 0 {
+		foreign glib {
+			g_source_remove :: proc(tag: c.uint) -> c.bool ---
+		}
+		g_source_remove(state.lcd_preview_timer_id)
+		state.lcd_preview_timer_id = 0
+	}
 }
 
 build_settings_page :: proc(state: ^App_State) -> GtkWidget {
@@ -1535,6 +1823,8 @@ on_lcd_fan_selected :: proc "c" (dropdown: GtkDropDown, pspec: rawptr, user_data
 	if selected == 0 {
 		state.selected_lcd_device = -1
 		state.selected_lcd_fan = -1
+		// Stop preview playback when deselecting
+		stop_lcd_preview_playback(state)
 		gtk_widget_queue_draw(auto_cast state.lcd_preview_area)
 		return
 	}
@@ -1559,6 +1849,15 @@ on_lcd_fan_selected :: proc "c" (dropdown: GtkDropDown, pspec: rawptr, user_data
 				state.selected_lcd_fan = fan_idx
 				fmt.printfln("Selected LCD fan: Device %d (MAC: %s, rx_type: %d), Fan %d",
 					dev_idx, device.mac_str, device.rx_type, fan_idx)
+
+				// Stop any existing preview playback
+				stop_lcd_preview_playback(state)
+
+				// Load preview from saved configuration
+				settings, settings_err := load_settings()
+				if settings_err == .None {
+					load_lcd_preview_from_config(state, settings)
+				}
 
 				// Redraw LCD preview
 				gtk_widget_queue_draw(auto_cast state.lcd_preview_area)

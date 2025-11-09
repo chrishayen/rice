@@ -97,9 +97,11 @@ process_lcd_frame_raylib :: proc(
 	texture := rl.LoadTextureFromImage(image)
 	defer rl.UnloadTexture(texture)
 
+	// Begin frame - required even in headless mode for proper OpenGL state management
+	rl.BeginDrawing()
+
 	// Begin rendering to texture
 	rl.BeginTextureMode(processor.render_texture)
-	defer rl.EndTextureMode()
 
 	rl.ClearBackground(rl.BLACK)
 
@@ -155,6 +157,12 @@ process_lcd_frame_raylib :: proc(
 		rotation,
 		rl.WHITE,
 	)
+
+	// End texture mode before ending drawing
+	rl.EndTextureMode()
+
+	// End frame - flushes OpenGL commands and updates state
+	rl.EndDrawing()
 
 	// Read pixels from render texture
 	rendered_image := rl.LoadImageFromTexture(processor.render_texture.texture)
