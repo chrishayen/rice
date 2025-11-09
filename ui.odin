@@ -359,6 +359,13 @@ App_State :: struct {
 	selected_lcd_fan:      int,  // Fan index within the device, -1 if none selected
 	usb_lcd_devices:       [dynamic]USB_LCD_Device,  // USB LCD devices indexed by rx_type
 
+	// LCD transform controls
+	lcd_zoom_scale:        GtkScale,
+	lcd_rotation_scale:    GtkScale,
+	lcd_rot_speed_scale:   GtkScale,
+	lcd_rot_dir_dropdown:  GtkDropDown,
+	lcd_flip_switch:       GtkCheckButton,
+
 	// LCD preview rendering
 	lcd_raylib_processor:   LCD_Raylib_Processor,  // Raylib processor for preview
 	lcd_preview_surface:    cairo_surface_t,        // Cairo surface for rendering to GTK
@@ -366,12 +373,11 @@ App_State :: struct {
 	lcd_preview_transform:  LCD_Transform,          // Current transform settings
 
 	// LCD preview playback
-	lcd_preview_frames_dir: string,                 // Directory containing preview frames
-	lcd_preview_frame_list: [dynamic]string,        // List of frame file paths
-	lcd_preview_frame_idx:  int,                    // Current frame index
-	lcd_preview_timer_id:   c.uint,                 // GTK timer ID for playback
-	lcd_preview_playing:    bool,                   // Whether preview is playing
-	lcd_preview_fps:        f32,                    // Playback FPS
+	lcd_preview_frames:    LCD_Frame_List,          // Frame list from shared module
+	lcd_preview_sequencer: LCD_Animation_Sequencer, // Frame sequencing from shared module
+	lcd_preview_timer_id:  c.uint,                  // GTK timer ID for playback
+	lcd_preview_playing:   bool,                    // Whether preview is playing
+	lcd_preview_fps:       f32,                     // Playback FPS
 }
 
 Device :: struct {
@@ -492,13 +498,7 @@ run_ui :: proc() {
 	// Stop preview playback
 	stop_lcd_preview_playback(state)
 	// Cleanup preview frame list
-	for path in state.lcd_preview_frame_list {
-		delete(path)
-	}
-	delete(state.lcd_preview_frame_list)
-	if state.lcd_preview_frames_dir != "" {
-		delete(state.lcd_preview_frames_dir)
-	}
+	destroy_frame_list(&state.lcd_preview_frames)
 }
 
 on_activate :: proc "c" (app: AdwApplication, user_data: rawptr) {
@@ -549,12 +549,19 @@ on_activate :: proc "c" (app: AdwApplication, user_data: rawptr) {
 	// Set content
 	adw_application_window_set_content(auto_cast window, main_box)
 
-	// Show window
+	// Show window - add close handler to stop preview
+	on_window_close :: proc "c" (window: rawptr, user_data: rawptr) -> c.bool {
+		context = runtime.default_context()
+		state := cast(^App_State)user_data
+		stop_lcd_preview_playback(state)
+		return false // Allow window to close
+	}
+
 	g_signal_connect_data(
 		window,
 		"close-request",
-		auto_cast proc "c" () -> c.bool {return false},
-		nil,
+		auto_cast on_window_close,
+		state,
 		nil,
 		0,
 	)
@@ -922,37 +929,40 @@ build_lcd_controls :: proc(state: ^App_State) -> GtkWidget {
 	// Zoom row
 	zoom_row := auto_cast adw_action_row_new()
 	adw_preferences_row_set_title(zoom_row, "Zoom (Center Crop)")
-	zoom_scale := auto_cast gtk_scale_new_with_range(.HORIZONTAL, 0, 90, 1)
-	gtk_range_set_value(zoom_scale, 0)
-	gtk_scale_set_digits(auto_cast zoom_scale, 0)
-	gtk_scale_set_draw_value(auto_cast zoom_scale, true)
-	gtk_widget_set_hexpand(auto_cast zoom_scale, true)
-	gtk_widget_set_size_request(auto_cast zoom_scale, 200, -1)
-	adw_action_row_add_suffix(auto_cast zoom_row, auto_cast zoom_scale)
+	state.lcd_zoom_scale = auto_cast gtk_scale_new_with_range(.HORIZONTAL, 0, 90, 1)
+	gtk_range_set_value(auto_cast state.lcd_zoom_scale, 0)
+	gtk_scale_set_digits(state.lcd_zoom_scale, 0)
+	gtk_scale_set_draw_value(state.lcd_zoom_scale, true)
+	gtk_widget_set_hexpand(auto_cast state.lcd_zoom_scale, true)
+	gtk_widget_set_size_request(auto_cast state.lcd_zoom_scale, 200, -1)
+	g_signal_connect_data(state.lcd_zoom_scale, "value-changed", auto_cast on_lcd_transform_changed, state, nil, 0)
+	adw_action_row_add_suffix(auto_cast zoom_row, auto_cast state.lcd_zoom_scale)
 	adw_preferences_group_add(auto_cast transform_group, zoom_row)
 
 	// Rotation row
 	rotation_row := auto_cast adw_action_row_new()
 	adw_preferences_row_set_title(rotation_row, "Rotation (degrees)")
-	rotation_scale := auto_cast gtk_scale_new_with_range(.HORIZONTAL, 0, 360, 1)
-	gtk_range_set_value(rotation_scale, 0)
-	gtk_scale_set_digits(auto_cast rotation_scale, 0)
-	gtk_scale_set_draw_value(auto_cast rotation_scale, true)
-	gtk_widget_set_hexpand(auto_cast rotation_scale, true)
-	gtk_widget_set_size_request(auto_cast rotation_scale, 200, -1)
-	adw_action_row_add_suffix(auto_cast rotation_row, auto_cast rotation_scale)
+	state.lcd_rotation_scale = auto_cast gtk_scale_new_with_range(.HORIZONTAL, 0, 360, 1)
+	gtk_range_set_value(auto_cast state.lcd_rotation_scale, 0)
+	gtk_scale_set_digits(state.lcd_rotation_scale, 0)
+	gtk_scale_set_draw_value(state.lcd_rotation_scale, true)
+	gtk_widget_set_hexpand(auto_cast state.lcd_rotation_scale, true)
+	gtk_widget_set_size_request(auto_cast state.lcd_rotation_scale, 200, -1)
+	g_signal_connect_data(state.lcd_rotation_scale, "value-changed", auto_cast on_lcd_transform_changed, state, nil, 0)
+	adw_action_row_add_suffix(auto_cast rotation_row, auto_cast state.lcd_rotation_scale)
 	adw_preferences_group_add(auto_cast transform_group, rotation_row)
 
 	// Rotation speed row
 	rot_speed_row := auto_cast adw_action_row_new()
 	adw_preferences_row_set_title(rot_speed_row, "Rotation Speed (deg/frame)")
-	rot_speed_scale := auto_cast gtk_scale_new_with_range(.HORIZONTAL, 0, 10, 0.1)
-	gtk_range_set_value(rot_speed_scale, 0)
-	gtk_scale_set_digits(auto_cast rot_speed_scale, 1)
-	gtk_scale_set_draw_value(auto_cast rot_speed_scale, true)
-	gtk_widget_set_hexpand(auto_cast rot_speed_scale, true)
-	gtk_widget_set_size_request(auto_cast rot_speed_scale, 200, -1)
-	adw_action_row_add_suffix(auto_cast rot_speed_row, auto_cast rot_speed_scale)
+	state.lcd_rot_speed_scale = auto_cast gtk_scale_new_with_range(.HORIZONTAL, 0, 10, 0.1)
+	gtk_range_set_value(auto_cast state.lcd_rot_speed_scale, 0)
+	gtk_scale_set_digits(state.lcd_rot_speed_scale, 1)
+	gtk_scale_set_draw_value(state.lcd_rot_speed_scale, true)
+	gtk_widget_set_hexpand(auto_cast state.lcd_rot_speed_scale, true)
+	gtk_widget_set_size_request(auto_cast state.lcd_rot_speed_scale, 200, -1)
+	g_signal_connect_data(state.lcd_rot_speed_scale, "value-changed", auto_cast on_lcd_transform_changed, state, nil, 0)
+	adw_action_row_add_suffix(auto_cast rot_speed_row, auto_cast state.lcd_rot_speed_scale)
 	adw_preferences_group_add(auto_cast transform_group, rot_speed_row)
 
 	// Rotation direction row
@@ -961,18 +971,20 @@ build_lcd_controls :: proc(state: ^App_State) -> GtkWidget {
 	rot_dir_list := gtk_string_list_new(nil)
 	gtk_string_list_append(rot_dir_list, "Counter-Clockwise")
 	gtk_string_list_append(rot_dir_list, "Clockwise")
-	rot_dir_dropdown := auto_cast gtk_drop_down_new(rot_dir_list, nil)
-	gtk_drop_down_set_selected(auto_cast rot_dir_dropdown, 0)
-	adw_action_row_add_suffix(auto_cast rot_dir_row, auto_cast rot_dir_dropdown)
+	state.lcd_rot_dir_dropdown = auto_cast gtk_drop_down_new(rot_dir_list, nil)
+	gtk_drop_down_set_selected(state.lcd_rot_dir_dropdown, 0)
+	g_signal_connect_data(state.lcd_rot_dir_dropdown, "notify::selected", auto_cast on_lcd_transform_changed, state, nil, 0)
+	adw_action_row_add_suffix(auto_cast rot_dir_row, auto_cast state.lcd_rot_dir_dropdown)
 	adw_preferences_group_add(auto_cast transform_group, rot_dir_row)
 
 	// Flip horizontal row
 	flip_row := auto_cast adw_action_row_new()
 	adw_preferences_row_set_title(flip_row, "Flip Horizontal")
-	flip_switch := auto_cast gtk_check_button_new()
-	gtk_check_button_set_active(auto_cast flip_switch, false)
-	adw_action_row_add_suffix(auto_cast flip_row, flip_switch)
-	adw_action_row_set_activatable_widget(auto_cast flip_row, flip_switch)
+	state.lcd_flip_switch = auto_cast gtk_check_button_new()
+	gtk_check_button_set_active(state.lcd_flip_switch, false)
+	g_signal_connect_data(state.lcd_flip_switch, "toggled", auto_cast on_lcd_transform_changed, state, nil, 0)
+	adw_action_row_add_suffix(auto_cast flip_row, auto_cast state.lcd_flip_switch)
+	adw_action_row_set_activatable_widget(auto_cast flip_row, auto_cast state.lcd_flip_switch)
 	adw_preferences_group_add(auto_cast transform_group, flip_row)
 
 	// Overlay Options group
@@ -1210,8 +1222,27 @@ draw_lcd_preview :: proc "c" (
 
 // Load LCD preview from saved configuration
 load_lcd_preview_from_config :: proc(state: ^App_State, settings: App_Settings) {
-	// Set transform to defaults
-	state.lcd_preview_transform = LCD_Transform{}
+	// Load transform from device cache for selected device
+	transform := LCD_Transform{zoom_percent = 35.0} // Default
+	if state.selected_lcd_device >= 0 && state.selected_lcd_device < len(state.devices) {
+		device := state.devices[state.selected_lcd_device]
+		device_transform, err := get_device_transform(device.mac_str)
+		if err == .None {
+			transform = device_transform
+		}
+	}
+
+	state.lcd_preview_transform = transform
+
+	// Update UI controls to reflect the saved transform
+	if state.lcd_zoom_scale != nil {
+		gtk_range_set_value(auto_cast state.lcd_zoom_scale, f64(transform.zoom_percent))
+		gtk_range_set_value(auto_cast state.lcd_rotation_scale, f64(transform.rotate_degrees))
+		gtk_range_set_value(auto_cast state.lcd_rot_speed_scale, f64(transform.rotation_speed))
+		gtk_check_button_set_active(state.lcd_flip_switch, transform.flip_horizontal)
+		rot_dir_idx := transform.rotation_direction == .CCW ? 0 : 1
+		gtk_drop_down_set_selected(state.lcd_rot_dir_dropdown, c.uint(rot_dir_idx))
+	}
 
 	// Try to load frames from config directory
 	config_dir, err := get_config_dir()
@@ -1300,44 +1331,17 @@ update_lcd_preview :: proc(state: ^App_State, jpeg_data: []u8, transform: LCD_Tr
 	}
 }
 
-// Load list of preview frames from directory
+// Load list of preview frames from directory (using shared module)
 load_preview_frames_list :: proc(state: ^App_State, frames_dir: string) -> bool {
 	// Clear existing frame list
-	for path in state.lcd_preview_frame_list {
-		delete(path)
-	}
-	clear(&state.lcd_preview_frame_list)
+	destroy_frame_list(&state.lcd_preview_frames)
 
-	// Store directory
-	if state.lcd_preview_frames_dir != "" {
-		delete(state.lcd_preview_frames_dir)
-	}
-	state.lcd_preview_frames_dir = strings.clone(frames_dir)
+	// Enumerate frames using shared module
+	frames, ok := enumerate_lcd_frames(frames_dir)
+	if !ok do return false
 
-	// Read directory
-	dir_handle, err := os.open(frames_dir)
-	if err != os.ERROR_NONE do return false
-	defer os.close(dir_handle)
-
-	file_infos, read_err := os.read_dir(dir_handle, -1)
-	if read_err != os.ERROR_NONE do return false
-	defer delete(file_infos)
-
-	// Collect JPEG files
-	for info in file_infos {
-		if info.is_dir do continue
-
-		ext := filepath.ext(info.name)
-		if ext != ".jpg" && ext != ".jpeg" do continue
-
-		full_path := filepath.join({frames_dir, info.name})
-		append(&state.lcd_preview_frame_list, full_path)
-	}
-
-	// Sort alphabetically
-	slice.sort(state.lcd_preview_frame_list[:])
-
-	return len(state.lcd_preview_frame_list) > 0
+	state.lcd_preview_frames = frames
+	return true
 }
 
 // Timer callback for preview playback
@@ -1345,22 +1349,19 @@ lcd_preview_timer_callback :: proc "c" (user_data: rawptr) -> c.bool {
 	context = runtime.default_context()
 	state := cast(^App_State)user_data
 
-	if !state.lcd_preview_playing || len(state.lcd_preview_frame_list) == 0 {
+	if !state.lcd_preview_playing || len(state.lcd_preview_frames.frame_paths) == 0 || state.lcd_preview_area == nil {
 		return false // Stop timer
 	}
 
-	// Load current frame
-	frame_path := state.lcd_preview_frame_list[state.lcd_preview_frame_idx]
-	frame_data, ok := os.read_entire_file(frame_path)
+	// Get current frame and advance sequencer
+	frame_idx, should_continue := advance_frame(&state.lcd_preview_sequencer)
+	if !should_continue do return false // Playback ended (non-looping)
+
+	// Load current frame using shared module
+	frame_data, ok := load_animation_frame(&state.lcd_preview_frames, frame_idx)
 	if ok {
 		update_lcd_preview(state, frame_data, state.lcd_preview_transform)
 		delete(frame_data)
-	}
-
-	// Advance to next frame (loop back to start)
-	state.lcd_preview_frame_idx += 1
-	if state.lcd_preview_frame_idx >= len(state.lcd_preview_frame_list) {
-		state.lcd_preview_frame_idx = 0
 	}
 
 	return true // Continue timer
@@ -1369,11 +1370,13 @@ lcd_preview_timer_callback :: proc "c" (user_data: rawptr) -> c.bool {
 // Start LCD preview playback
 start_lcd_preview_playback :: proc(state: ^App_State, fps: f32 = 20.0) {
 	if state.lcd_preview_playing do return
-	if len(state.lcd_preview_frame_list) == 0 do return
+	if len(state.lcd_preview_frames.frame_paths) == 0 do return
 
 	state.lcd_preview_playing = true
 	state.lcd_preview_fps = fps
-	state.lcd_preview_frame_idx = 0
+
+	// Initialize sequencer with looping enabled
+	state.lcd_preview_sequencer = init_sequencer(len(state.lcd_preview_frames.frame_paths), loop = true)
 
 	// Calculate interval in milliseconds
 	interval := c.uint(1000.0 / fps)
@@ -1871,6 +1874,37 @@ on_lcd_fan_selected :: proc "c" (dropdown: GtkDropDown, pspec: rawptr, user_data
 	state.selected_lcd_device = -1
 	state.selected_lcd_fan = -1
 	gtk_widget_queue_draw(auto_cast state.lcd_preview_area)
+}
+
+// Handler for LCD transform changes (zoom, rotation, etc.)
+on_lcd_transform_changed :: proc "c" (widget: rawptr, user_data: rawptr) {
+	context = runtime.default_context()
+	state := cast(^App_State)user_data
+
+	if state.lcd_zoom_scale == nil do return
+
+	// Read all transform values
+	transform: LCD_Transform
+	transform.zoom_percent = f32(gtk_range_get_value(auto_cast state.lcd_zoom_scale))
+	transform.rotate_degrees = f32(gtk_range_get_value(auto_cast state.lcd_rotation_scale))
+	transform.rotation_speed = f32(gtk_range_get_value(auto_cast state.lcd_rot_speed_scale))
+	transform.flip_horizontal = gtk_check_button_get_active(auto_cast state.lcd_flip_switch)
+
+	// Get rotation direction
+	rot_dir_selected := gtk_drop_down_get_selected(state.lcd_rot_dir_dropdown)
+	transform.rotation_direction = rot_dir_selected == 0 ? .CCW : .CW
+
+	// Update the state transform
+	state.lcd_preview_transform = transform
+
+	// Save to device cache for the selected device
+	if state.selected_lcd_device >= 0 && state.selected_lcd_device < len(state.devices) {
+		device := state.devices[state.selected_lcd_device]
+		save_err := update_device_transform(device.mac_str, transform)
+		if save_err != .None {
+			fmt.printfln("Warning: Failed to save LCD transform for device %s: %v", device.mac_str, save_err)
+		}
+	}
 }
 
 // Get USB LCD device by rx_type (lcd_group index)

@@ -28,6 +28,7 @@ Device_Cache_Entry :: struct {
 	timestamp:     u32,
 	fan_types:     [4]u8,
 	has_lcd:       bool,
+	lcd_transform: LCD_Transform, // LCD transform settings for this device
 }
 
 Device_Cache :: struct {
@@ -60,6 +61,9 @@ device_to_cache_entry :: proc(device: RF_Device_Info) -> Device_Cache_Entry {
 		}
 	}
 
+	// Default transform: 35% zoom for LCD devices
+	default_transform := LCD_Transform{zoom_percent = 35.0}
+
 	return Device_Cache_Entry{
 		mac_str       = device.mac_str,
 		dev_type_name = device.dev_type_name,
@@ -70,6 +74,7 @@ device_to_cache_entry :: proc(device: RF_Device_Info) -> Device_Cache_Entry {
 		timestamp     = device.timestamp,
 		fan_types     = device.fan_types,
 		has_lcd       = has_lcd,
+		lcd_transform = default_transform,
 	}
 }
 
@@ -142,4 +147,72 @@ load_device_cache :: proc() -> ([]Device_Cache_Entry, Device_Cache_Error) {
 	}
 
 	return cache.devices, .None
+}
+
+// Update LCD transform for a specific device by MAC address
+update_device_transform :: proc(mac_str: string, transform: LCD_Transform) -> Device_Cache_Error {
+	// Load current cache
+	devices, load_err := load_device_cache()
+	if load_err != .None {
+		return load_err
+	}
+	defer delete(devices)
+
+	// Find and update the device
+	found := false
+	for &device in devices {
+		if device.mac_str == mac_str {
+			device.lcd_transform = transform
+			found = true
+			break
+		}
+	}
+
+	if !found {
+		return .Load_Failed // Device not found
+	}
+
+	// Save updated cache
+	cache_path, path_err := get_device_cache_path()
+	defer delete(cache_path)
+
+	if path_err != .None {
+		return .Path_Error
+	}
+
+	cache := Device_Cache{
+		devices    = devices,
+		updated_at = time.to_unix_seconds(time.now()),
+	}
+
+	json_data, marshal_err := json.marshal(cache, {pretty = true})
+	if marshal_err != nil {
+		return .Marshal_Failed
+	}
+	defer delete(json_data)
+
+	write_err := os.write_entire_file(cache_path, json_data)
+	if !write_err {
+		return .Save_Failed
+	}
+
+	return .None
+}
+
+// Get LCD transform for a specific device by MAC address
+get_device_transform :: proc(mac_str: string) -> (LCD_Transform, Device_Cache_Error) {
+	devices, load_err := load_device_cache()
+	if load_err != .None {
+		return {}, load_err
+	}
+	defer delete(devices)
+
+	for device in devices {
+		if device.mac_str == mac_str {
+			return device.lcd_transform, .None
+		}
+	}
+
+	// Return default if not found
+	return LCD_Transform{zoom_percent = 35.0}, .None
 }

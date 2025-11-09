@@ -1094,19 +1094,34 @@ init_lcd_playback_test :: proc(state: ^Service_State) {
 	frames_dir := fmt.aprintf("%s/lcd_frames/bad_apple", config_dir)
 	defer delete(frames_dir)
 
-	// Disable image processing for now
-	transform := LCD_Transform{
-		zoom_percent = 0.0,
-	}
-
 	// Load settings to get LCD device configuration
 	settings, settings_err := load_settings()
 	if settings_err != .None {
 		log_warn("Failed to load settings, using auto-detect: %v", settings_err)
-		settings = App_Settings{lcd_device_bus = 0, lcd_device_address = 0}
+		settings = App_Settings{
+			lcd_device_bus = 0,
+			lcd_device_address = 0,
+		}
+	}
+
+	// Find first LCD device in cache to get MAC and load transform
+	transform := LCD_Transform{zoom_percent = 35.0} // Default
+	for entry in cache {
+		if entry.has_lcd {
+			device_transform, transform_err := get_device_transform(entry.mac_str)
+			if transform_err == .None {
+				transform = device_transform
+				log_info("Loaded LCD transform for device %s", entry.mac_str)
+			}
+			break // Use first LCD device found
+		}
 	}
 
 	log_info("Using LCD device: bus=%d, address=%d", settings.lcd_device_bus, settings.lcd_device_address)
+	log_info("Using LCD transform: zoom=%.1f%%, rotation=%.1f deg, rotation_speed=%.1f deg/s",
+		transform.zoom_percent,
+		transform.rotate_degrees,
+		transform.rotation_speed)
 
 	// Create LCD playback state (load from configuration)
 	playback, lcd_err := create_lcd_playback(settings.lcd_device_bus, settings.lcd_device_address, frames_dir, fps = 20.0, loop = true, transform = transform)
@@ -1116,7 +1131,7 @@ init_lcd_playback_test :: proc(state: ^Service_State) {
 	}
 
 	state.lcd_playback = playback
-	log_info("LCD playback initialized: %d frames at %.1f fps", len(playback.frame_paths), playback.fps)
+	log_info("LCD playback initialized: %d frames at %.1f fps", len(playback.frames.frame_paths), playback.fps)
 
 	// Start playback
 	start_lcd_playback(playback)

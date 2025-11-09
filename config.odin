@@ -108,7 +108,10 @@ load_settings :: proc() -> (App_Settings, Config_Error) {
 	// Return default settings if file doesn't exist
 	if !os.exists(settings_path) {
 		// Default: auto-detect first LCD device (bus=0, address=0)
-		return App_Settings{lcd_device_bus = 0, lcd_device_address = 0}, .None
+		return App_Settings{
+			lcd_device_bus = 0,
+			lcd_device_address = 0,
+		}, .None
 	}
 
 	// Read file

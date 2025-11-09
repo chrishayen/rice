@@ -15,11 +15,9 @@ import "core:time"
 // LCD playback state for a single device
 LCD_Playback_State :: struct {
 	device:           LCD_Device,
-	frames_dir:       string,
-	frame_paths:      [dynamic]string,
-	current_frame:    int,
+	frames:           LCD_Frame_List,          // Frame list from shared module
+	sequencer:        LCD_Animation_Sequencer, // Frame sequencing from shared module
 	fps:              f32,
-	loop:             bool,
 	transform:        LCD_Transform,
 	running:          bool,
 	thread:           ^thread.Thread,
@@ -39,106 +37,69 @@ create_lcd_playback :: proc(bus: int, address: int, frames_dir: string, fps: f32
 	}
 
 	state.device = device
-	state.frames_dir = strings.clone(frames_dir, allocator)
 	state.fps = fps
-	state.loop = loop
 	state.transform = transform
 	state.running = false
-	state.current_frame = 0
 
-	// Enumerate frame files
-	err2 := enumerate_frames(state, allocator)
-	if err2 != .None {
+	// Enumerate frame files using shared module
+	frames, frames_ok := enumerate_lcd_frames(frames_dir, allocator)
+	if !frames_ok {
 		cleanup_lcd_device(&state.device)
-		delete(state.frames_dir, allocator)
 		free(state, allocator)
-		return nil, err2
+		return nil, .Device_Not_Found
 	}
+	state.frames = frames
 
-	// Initialize raylib processor if any transforms are needed
+	// Initialize sequencer
+	state.sequencer = init_sequencer(len(state.frames.frame_paths), loop)
+
+	// Check if transforms are needed - raylib will be initialized in playback thread
 	state.use_raylib = transform.zoom_percent > 0 ||
 	                   transform.rotate_degrees != 0 ||
 	                   transform.rotation_speed != 0 ||
 	                   transform.flip_horizontal
 
 	if state.use_raylib {
-		processor, proc_ok := init_lcd_raylib_processor(LCD_WIDTH, LCD_HEIGHT)
-		if !proc_ok {
-			fmt.println("Warning: Failed to initialize raylib processor, transforms will be disabled")
-			state.use_raylib = false
-		} else {
-			state.raylib_processor = processor
-			fmt.println("Raylib processor enabled for LCD transforms")
-		}
+		fmt.println("LCD transforms enabled (raylib will initialize in playback thread)")
 	}
 
-	fmt.printfln("LCD Playback initialized: %d frames, %.1f fps", len(state.frame_paths), fps)
+	fmt.printfln("LCD Playback initialized: %d frames, %.1f fps", len(state.frames.frame_paths), fps)
 
 	return state, .None
 }
-
-// Enumerate all frame files in the directory
-enumerate_frames :: proc(state: ^LCD_Playback_State, allocator := context.allocator) -> LCD_Error {
-	// Read directory
-	dir_handle, err := os.open(state.frames_dir)
-	if err != os.ERROR_NONE {
-		fmt.printfln("Error opening frames directory: %v", err)
-		return .Device_Not_Found
-	}
-	defer os.close(dir_handle)
-
-	file_infos, read_err := os.read_dir(dir_handle, -1, allocator)
-	if read_err != os.ERROR_NONE {
-		fmt.printfln("Error reading frames directory: %v", read_err)
-		return .Device_Not_Found
-	}
-	defer delete(file_infos, allocator)
-
-	// Collect .jpg files
-	state.frame_paths = make([dynamic]string, 0, len(file_infos), allocator)
-
-	for info in file_infos {
-		if info.is_dir do continue
-
-		// Check if it's a JPEG file
-		ext := filepath.ext(info.name)
-		if ext != ".jpg" && ext != ".jpeg" do continue
-
-		// Build full path
-		full_path := filepath.join({state.frames_dir, info.name}, allocator)
-		append(&state.frame_paths, full_path)
-	}
-
-	// Sort frame paths alphabetically
-	slice.sort(state.frame_paths[:])
-
-	if len(state.frame_paths) == 0 {
-		fmt.println("No JPEG frames found in directory")
-		return .Device_Not_Found
-	}
-
-	return .None
-}
-
 // Playback thread function
 lcd_playback_thread :: proc(data: rawptr) {
 	state := cast(^LCD_Playback_State)data
 	context = runtime.default_context()
 
-	fmt.printfln("LCD playback thread started: %d frames at %.1f fps", len(state.frame_paths), state.fps)
+	fmt.printfln("LCD playback thread started: %d frames at %.1f fps", len(state.frames.frame_paths), state.fps)
+
+	// Initialize raylib processor in this thread if needed
+	if state.use_raylib {
+		processor, proc_ok := init_lcd_raylib_processor(LCD_WIDTH, LCD_HEIGHT)
+		if !proc_ok {
+			fmt.println("Warning: Failed to initialize raylib processor in playback thread, transforms will be disabled")
+			state.use_raylib = false
+		} else {
+			state.raylib_processor = processor
+			fmt.println("Raylib processor initialized in playback thread")
+		}
+	}
+	defer if state.use_raylib do cleanup_lcd_raylib_processor(&state.raylib_processor)
 
 	frame_delay := time.Duration(1.0 / f64(state.fps) * f64(time.Second))
 	frame_count := 0
 	start_time := time.now()
 
 	for state.running {
-		// Get current frame path
-		frame_path := state.frame_paths[state.current_frame]
+		// Get current frame and advance sequencer
+		frame_idx, should_continue := advance_frame(&state.sequencer)
+		if !should_continue do break // Playback ended (non-looping)
 
-		// Load frame file
-		frame_data, ok := os.read_entire_file(frame_path, context.allocator)
+		// Load frame file using shared module
+		frame_data, ok := load_animation_frame(&state.frames, frame_idx, context.allocator)
 		if !ok {
-			fmt.printfln("Error loading frame: %s", frame_path)
+			fmt.printfln("Error loading frame %d", frame_idx)
 			time.sleep(frame_delay)
 			continue
 		}
@@ -153,33 +114,23 @@ lcd_playback_thread :: proc(data: rawptr) {
 				&state.raylib_processor,
 				frame_data,
 				state.transform,
-				state.current_frame,
+				frame_idx,
 				context.allocator,
 			)
 			if proc_ok {
 				defer delete(processed, context.allocator)
 				final_frame_data = processed
 			} else {
-				fmt.printfln("Error processing frame %d with raylib, using original", state.current_frame)
+				fmt.printfln("Error processing frame %d with raylib, using original", frame_idx)
 			}
 		}
 
 		// Send frame to LCD
 		send_err := send_lcd_frame(&state.device, final_frame_data)
 		if send_err != .None {
-			fmt.printfln("Error sending frame %d: %v", state.current_frame, send_err)
-		} else if state.current_frame < 5 {
-			fmt.printfln("Successfully sent frame %d (%d bytes)", state.current_frame, len(frame_data))
-		}
-
-		// Advance to next frame
-		state.current_frame += 1
-		if state.current_frame >= len(state.frame_paths) {
-			if state.loop {
-				state.current_frame = 0
-			} else {
-				break
-			}
+			fmt.printfln("Error sending frame %d: %v", frame_idx, send_err)
+		} else if frame_idx < 5 {
+			fmt.printfln("Successfully sent frame %d (%d bytes)", frame_idx, len(frame_data))
 		}
 
 		// Stats every second
@@ -188,7 +139,7 @@ lcd_playback_thread :: proc(data: rawptr) {
 			elapsed := time.since(start_time)
 			actual_fps := f64(frame_count) / time.duration_seconds(elapsed)
 			fmt.printfln("LCD playback: frame %d/%d, actual FPS: %.1f",
-				state.current_frame, len(state.frame_paths), actual_fps)
+				frame_idx, len(state.frames.frame_paths), actual_fps)
 		}
 
 		// Sleep for frame delay
@@ -203,7 +154,7 @@ start_lcd_playback :: proc(state: ^LCD_Playback_State) {
 	if state.running do return
 
 	state.running = true
-	state.current_frame = 0
+	reset_sequencer(&state.sequencer)
 
 	state.thread = thread.create_and_start_with_data(state, lcd_playback_thread)
 }
@@ -225,19 +176,12 @@ stop_lcd_playback_state :: proc(state: ^LCD_Playback_State) {
 destroy_lcd_playback :: proc(state: ^LCD_Playback_State, allocator := context.allocator) {
 	stop_lcd_playback_state(state)
 
-	// Cleanup raylib processor if it was initialized
-	if state.use_raylib {
-		cleanup_lcd_raylib_processor(&state.raylib_processor)
-	}
+	// Raylib processor cleanup is handled in thread defer
 
 	cleanup_lcd_device(&state.device)
 
-	delete(state.frames_dir, allocator)
-
-	for path in state.frame_paths {
-		delete(path, allocator)
-	}
-	delete(state.frame_paths)
+	// Cleanup frame list using shared module
+	destroy_frame_list(&state.frames, allocator)
 
 	free(state, allocator)
 }

@@ -24,6 +24,7 @@ init_lcd_raylib_processor :: proc(width: i32 = 400, height: i32 = 400) -> (proce
 	processor.height = height
 
 	// Initialize raylib in headless mode (no window)
+	rl.SetTraceLogLevel(.NONE)  // Disable raylib logging
 	rl.SetConfigFlags({.WINDOW_HIDDEN})
 	rl.InitWindow(width, height, "LCD Processor")
 	rl.SetTargetFPS(60)
