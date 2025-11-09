@@ -14,15 +14,17 @@ import "core:time"
 
 // LCD playback state for a single device
 LCD_Playback_State :: struct {
-	device:        LCD_Device,
-	frames_dir:    string,
-	frame_paths:   [dynamic]string,
-	current_frame: int,
-	fps:           f32,
-	loop:          bool,
-	transform:     LCD_Transform,
-	running:       bool,
-	thread:        ^thread.Thread,
+	device:           LCD_Device,
+	frames_dir:       string,
+	frame_paths:      [dynamic]string,
+	current_frame:    int,
+	fps:              f32,
+	loop:             bool,
+	transform:        LCD_Transform,
+	running:          bool,
+	thread:           ^thread.Thread,
+	raylib_processor: LCD_Raylib_Processor,  // Raylib image processor
+	use_raylib:       bool,                   // Whether to use raylib processing
 }
 
 // Create a new playback state
@@ -51,6 +53,23 @@ create_lcd_playback :: proc(bus: int, address: int, frames_dir: string, fps: f32
 		delete(state.frames_dir, allocator)
 		free(state, allocator)
 		return nil, err2
+	}
+
+	// Initialize raylib processor if any transforms are needed
+	state.use_raylib = transform.zoom_percent > 0 ||
+	                   transform.rotate_degrees != 0 ||
+	                   transform.rotation_speed != 0 ||
+	                   transform.flip_horizontal
+
+	if state.use_raylib {
+		processor, proc_ok := init_lcd_raylib_processor(LCD_WIDTH, LCD_HEIGHT)
+		if !proc_ok {
+			fmt.println("Warning: Failed to initialize raylib processor, transforms will be disabled")
+			state.use_raylib = false
+		} else {
+			state.raylib_processor = processor
+			fmt.println("Raylib processor enabled for LCD transforms")
+		}
 	}
 
 	fmt.printfln("LCD Playback initialized: %d frames, %.1f fps", len(state.frame_paths), fps)
@@ -127,18 +146,21 @@ lcd_playback_thread :: proc(data: rawptr) {
 
 		// Process image with transforms if needed
 		final_frame_data := frame_data
-		needs_processing := state.transform.zoom_percent > 0 ||
-		                    state.transform.rotate_degrees != 0 ||
-		                    state.transform.rotation_speed != 0 ||
-		                    state.transform.flip_horizontal
 
-		if needs_processing {
-			processed, proc_ok := process_lcd_image(frame_data, state.transform, state.current_frame, context.allocator)
+		if state.use_raylib {
+			// Use raylib for processing
+			processed, proc_ok := process_lcd_frame_raylib(
+				&state.raylib_processor,
+				frame_data,
+				state.transform,
+				state.current_frame,
+				context.allocator,
+			)
 			if proc_ok {
 				defer delete(processed, context.allocator)
 				final_frame_data = processed
 			} else {
-				fmt.printfln("Error processing frame %d, using original", state.current_frame)
+				fmt.printfln("Error processing frame %d with raylib, using original", state.current_frame)
 			}
 		}
 
@@ -202,6 +224,11 @@ stop_lcd_playback_state :: proc(state: ^LCD_Playback_State) {
 // Cleanup playback state
 destroy_lcd_playback :: proc(state: ^LCD_Playback_State, allocator := context.allocator) {
 	stop_lcd_playback_state(state)
+
+	// Cleanup raylib processor if it was initialized
+	if state.use_raylib {
+		cleanup_lcd_raylib_processor(&state.raylib_processor)
+	}
 
 	cleanup_lcd_device(&state.device)
 

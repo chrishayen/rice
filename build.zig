@@ -45,10 +45,10 @@ pub fn build(b: *std.Build) !void {
     // Get pkg-config flags
     const pkg_config_flags = try getPkgConfigFlags(b, &libs);
 
-    // Build additional linker flags
+    // Build additional linker flags (raylib doesn't have pkg-config, add manually)
     const extra_linker_flags = try std.fmt.allocPrint(
         b.allocator,
-        "{s} -lstdc++ -lpthread",
+        "{s} -lstdc++ -lpthread -lraylib -lGL -lm -lpthread -ldl -lrt -lX11",
         .{pkg_config_flags},
     );
 

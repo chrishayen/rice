@@ -1099,8 +1099,17 @@ init_lcd_playback_test :: proc(state: ^Service_State) {
 		zoom_percent = 0.0,
 	}
 
-	// Create LCD playback state (use bus 1, device 7)
-	playback, lcd_err := create_lcd_playback(1, 7, frames_dir, fps = 20.0, loop = true, transform = transform)
+	// Load settings to get LCD device configuration
+	settings, settings_err := load_settings()
+	if settings_err != .None {
+		log_warn("Failed to load settings, using auto-detect: %v", settings_err)
+		settings = App_Settings{lcd_device_bus = 0, lcd_device_address = 0}
+	}
+
+	log_info("Using LCD device: bus=%d, address=%d", settings.lcd_device_bus, settings.lcd_device_address)
+
+	// Create LCD playback state (load from configuration)
+	playback, lcd_err := create_lcd_playback(settings.lcd_device_bus, settings.lcd_device_address, frames_dir, fps = 20.0, loop = true, transform = transform)
 	if lcd_err != .None {
 		log_error("Failed to create LCD playback: %v", lcd_err)
 		return
