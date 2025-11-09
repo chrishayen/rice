@@ -9,6 +9,7 @@ import "core:c"
 import "core:encoding/json"
 import "core:fmt"
 import "core:math"
+import "core:mem"
 import "core:strings"
 
 // GTK4 + libadwaita bindings
@@ -335,6 +336,7 @@ App_State :: struct {
 	lcd_preview_area:      GtkDrawingArea,
 	selected_lcd_device:   int,  // Index into devices array, -1 if none selected
 	selected_lcd_fan:      int,  // Fan index within the device, -1 if none selected
+	usb_lcd_devices:       [dynamic]USB_LCD_Device,  // USB LCD devices indexed by rx_type
 }
 
 Device :: struct {
@@ -347,6 +349,13 @@ Device :: struct {
 	dev_type_name: string,
 	fan_types:     [4]u8,
 	has_lcd:       bool,
+}
+
+// USB LCD device info (indexed by rx_type / lcd_group)
+USB_LCD_Device :: struct {
+	bus:     int,
+	address: int,
+	index:   int,  // Enumeration order / lcd_group index
 }
 
 Effect_Info :: struct {
@@ -393,6 +402,7 @@ run_ui :: proc() {
 	state.unbind_buttons = make([dynamic]GtkWidget)
 	state.selected_lcd_device = -1
 	state.selected_lcd_fan = -1
+	state.usb_lcd_devices = make([dynamic]USB_LCD_Device)
 
 	// Initialize 3D view
 	state.view = View_State {
@@ -769,17 +779,18 @@ build_lcd_controls :: proc(state: ^App_State) -> GtkWidget {
 	fan_row := auto_cast adw_action_row_new()
 	adw_preferences_row_set_title(fan_row, "Target LCD Fan")
 	fan_list := gtk_string_list_new(nil)
-	gtk_string_list_append(fan_list, "No LCD fans available")
+	gtk_string_list_append(fan_list, "Select an LCD fan...")
 	state.lcd_fan_dropdown = auto_cast gtk_drop_down_new(fan_list, nil)
 	gtk_drop_down_set_selected(state.lcd_fan_dropdown, 0)
+	gtk_widget_set_size_request(auto_cast state.lcd_fan_dropdown, 300, -1)
 	adw_action_row_add_suffix(auto_cast fan_row, auto_cast state.lcd_fan_dropdown)
 	adw_preferences_group_add(auto_cast fan_group, fan_row)
 
 	// Connect signal for dropdown selection changes
 	g_signal_connect_data(state.lcd_fan_dropdown, "notify::selected", auto_cast on_lcd_fan_selected, state, nil, 0)
 
-	// Populate LCD fan list (will be updated when devices are loaded)
-	update_lcd_fan_list(state)
+	// Populate LCD fan list (will be updated when devices are loaded via rebuild_device_list)
+	// Initial call happens after devices are loaded by on_initial_poll
 
 	// Video Source group
 	source_group := auto_cast adw_preferences_group_new()
@@ -1074,6 +1085,18 @@ draw_lcd_preview :: proc "c" (
 		info_x := (c.double(width) - extents.width) / 2
 		cairo_move_to(cr, info_x, 30)
 		cairo_show_text(cr, info_cstr)
+
+		// Show USB mapping info
+		if usb_dev, ok := get_usb_lcd_device(state, device.rx_type); ok {
+			usb_text := fmt.tprintf("USB Bus:Address = %d:%d", usb_dev.bus, usb_dev.address)
+			usb_cstr := strings.clone_to_cstring(usb_text)
+			defer delete(usb_cstr)
+
+			cairo_text_extents(cr, usb_cstr, &extents)
+			usb_x := (c.double(width) - extents.width) / 2
+			cairo_move_to(cr, usb_x, 50)
+			cairo_show_text(cr, usb_cstr)
+		}
 	}
 
 	// Draw LCD screen border to show 400x400 area
@@ -1508,32 +1531,118 @@ on_lcd_fan_selected :: proc "c" (dropdown: GtkDropDown, pspec: rawptr, user_data
 
 	selected := int(gtk_drop_down_get_selected(dropdown))
 
-	// First entry is always "No LCD fans available" placeholder
+	// Index 0 is always the placeholder "Select an LCD fan..."
 	if selected == 0 {
 		state.selected_lcd_device = -1
 		state.selected_lcd_fan = -1
+		gtk_widget_queue_draw(auto_cast state.lcd_preview_area)
 		return
 	}
 
-	// Calculate which device and fan based on selection
-	// Format: each LCD device contributes fan_count entries
-	lcd_fan_count := 0
+	// Calculate which device and fan based on selection (accounting for placeholder at index 0)
+	// Only count fans that actually have LCD screens (types 24 or 25)
+	// Index 1 = first LCD fan, index 2 = second LCD fan, etc.
+	lcd_fan_count := 1  // Start at 1 because 0 is placeholder
 	for device, dev_idx in state.devices {
 		if !device.has_lcd do continue
 
 		for fan_idx in 0..<device.fan_count {
-			lcd_fan_count += 1
+			fan_type := device.fan_types[fan_idx]
+
+			// Only count fans with LCD capability
+			if fan_type != 24 && fan_type != 25 {
+				continue
+			}
+
 			if lcd_fan_count == selected {
 				state.selected_lcd_device = dev_idx
 				state.selected_lcd_fan = fan_idx
-				fmt.printfln("Selected LCD fan: Device %d, Fan %d", dev_idx, fan_idx)
+				fmt.printfln("Selected LCD fan: Device %d (MAC: %s, rx_type: %d), Fan %d",
+					dev_idx, device.mac_str, device.rx_type, fan_idx)
 
 				// Redraw LCD preview
 				gtk_widget_queue_draw(auto_cast state.lcd_preview_area)
 				return
 			}
+			lcd_fan_count += 1
 		}
 	}
+
+	// If we get here, selection index was invalid - reset
+	state.selected_lcd_device = -1
+	state.selected_lcd_fan = -1
+	gtk_widget_queue_draw(auto_cast state.lcd_preview_area)
+}
+
+// Get USB LCD device by rx_type (lcd_group index)
+get_usb_lcd_device :: proc(state: ^App_State, rx_type: u8) -> (USB_LCD_Device, bool) {
+	// rx_type is the lcd_group index
+	index := int(rx_type)
+
+	// Check if we have a device at this index
+	if index < 0 || index >= len(state.usb_lcd_devices) {
+		return {}, false
+	}
+
+	return state.usb_lcd_devices[index], true
+}
+
+// Enumerate USB LCD devices and store by index
+enumerate_usb_lcd_devices :: proc(state: ^App_State) {
+	clear(&state.usb_lcd_devices)
+
+	// Initialize libusb
+	ctx: rawptr
+	ret := libusb_init(&ctx)
+	if ret != LIBUSB_SUCCESS {
+		fmt.println("Failed to initialize libusb for LCD enumeration")
+		return
+	}
+	defer libusb_exit(ctx)
+
+	// Get device list
+	device_list: ^rawptr
+	device_count := libusb_get_device_list(ctx, &device_list)
+	if device_count < 0 {
+		fmt.println("Failed to get USB device list")
+		return
+	}
+	defer libusb_free_device_list(device_list, 1)
+
+	// Enumerate all LCD devices (VID 0x1cbe, PID 0x0005)
+	index := 0
+	for i in 0..<device_count {
+		device := mem.ptr_offset(device_list, i)^
+
+		// Get device descriptor
+		desc: Device_Descriptor
+		ret = libusb_get_device_descriptor(device, &desc)
+		if ret != LIBUSB_SUCCESS {
+			continue
+		}
+
+		// Check if this is an LCD device
+		if desc.idVendor != VID_WIRED || desc.idProduct != PID_WIRED {
+			continue
+		}
+
+		// Get bus and address
+		bus := int(libusb_get_bus_number(device))
+		address := int(libusb_get_device_address(device))
+
+		// Store this LCD device with its enumeration index
+		lcd_dev := USB_LCD_Device {
+			bus = bus,
+			address = address,
+			index = index,
+		}
+		append(&state.usb_lcd_devices, lcd_dev)
+
+		fmt.printfln("Found USB LCD device: index=%d, bus=%d, address=%d", index, bus, address)
+		index += 1
+	}
+
+	fmt.printfln("Total USB LCD devices found: %d", len(state.usb_lcd_devices))
 }
 
 // Update LCD fan dropdown list
@@ -1545,16 +1654,25 @@ update_lcd_fan_list :: proc(state: ^App_State) {
 	// Create new string list
 	fan_list := gtk_string_list_new(nil)
 
-	has_lcd_fans := false
-	for device in state.devices {
-		if !device.has_lcd do continue
-		has_lcd_fans = true
+	// Always add a placeholder as first entry
+	gtk_string_list_append(fan_list, "Select an LCD fan...")
 
-		// Add each fan from this device
+	// Add LCD fans from devices
+	for device, dev_idx in state.devices {
+		if !device.has_lcd do continue
+
+		// Add only fans that actually have LCD screens (types 24 or 25)
 		for fan_idx in 0..<device.fan_count {
-			// Format: "Device XX:XX:XX - Fan N"
+			fan_type := device.fan_types[fan_idx]
+
+			// Only add if this specific fan has LCD capability
+			if fan_type != 24 && fan_type != 25 {
+				continue
+			}
+
+			// Format: "Device XX:XX:XX - Fan N (USB rx_type)"
 			mac_short := device.mac_str[len(device.mac_str)-8:] if len(device.mac_str) >= 8 else device.mac_str
-			label := fmt.aprintf("Device %s - Fan %d", mac_short, fan_idx)
+			label := fmt.aprintf("Device %s - Fan %d (USB %d)", mac_short, fan_idx, device.rx_type)
 			defer delete(label)
 
 			label_cstr := strings.clone_to_cstring(label)
@@ -1564,16 +1682,13 @@ update_lcd_fan_list :: proc(state: ^App_State) {
 		}
 	}
 
-	if !has_lcd_fans {
-		gtk_string_list_append(fan_list, "No LCD fans available")
-		// Reset selection when no LCD fans
-		state.selected_lcd_device = -1
-		state.selected_lcd_fan = -1
-	}
-
 	// Update dropdown model
 	gtk_drop_down_set_model(state.lcd_fan_dropdown, fan_list)
+
+	// Reset to placeholder
 	gtk_drop_down_set_selected(state.lcd_fan_dropdown, 0)
+	state.selected_lcd_device = -1
+	state.selected_lcd_fan = -1
 }
 
 // 3D view drag callbacks

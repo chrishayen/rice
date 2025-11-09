@@ -65,11 +65,27 @@ pub fn build(b: *std.Build) !void {
         .{extra_linker_flags},
     );
 
+    const cwd = std.fs.cwd().realpathAlloc(b.allocator, ".") catch unreachable;
+
+    // Copy DES library files
+    const des_dep = b.dependency("des", .{});
+    const des_path = des_dep.path("").getPath(b);
+    const des_output_dir = try std.fmt.allocPrint(b.allocator, "{s}/libs/des", .{cwd});
+
+    const copy_des = b.addSystemCommand(&.{
+        "sh",
+        "-c",
+    });
+    const copy_des_cmd = try std.fmt.allocPrint(
+        b.allocator,
+        "mkdir -p {s} && cp {s}/des.odin {s}/",
+        .{ des_output_dir, des_path, des_output_dir },
+    );
+    copy_des.addArg(copy_des_cmd);
+
     // Build tinyuz static library using make
     const tinyuz_dep = b.dependency("tinyuz", .{});
     const tinyuz_path = tinyuz_dep.path("").getPath(b);
-
-    const cwd = std.fs.cwd().realpathAlloc(b.allocator, ".") catch unreachable;
     const output_dir = try std.fmt.allocPrint(b.allocator, "{s}/libs/tinyuz", .{cwd});
 
     // Clone HDiffPatch (tinyuz's dependency) and build tinyuz in one step
@@ -96,6 +112,7 @@ pub fn build(b: *std.Build) !void {
     });
     odin_compile.addArg(des_key_define);
     odin_compile.addArg(extra_linker_flag);
+    odin_compile.step.dependOn(&copy_des.step);
     odin_compile.step.dependOn(&build_tinyuz.step);
 
     // Install the built binary
@@ -119,7 +136,7 @@ pub fn build(b: *std.Build) !void {
     const odin_test = b.addSystemCommand(&.{"odin"});
     odin_test.addArgs(&.{
         "test",
-        ".",
+        "tests",
         "-all-packages",
         "-o:speed",
     });

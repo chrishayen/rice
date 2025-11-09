@@ -149,6 +149,9 @@ rebuild_device_list :: proc(state: ^App_State) {
 		device_idx += 1
 	}
 
+	// Enumerate USB LCD devices for mapping
+	enumerate_usb_lcd_devices(state)
+
 	// Update LCD fan list when devices change
 	update_lcd_fan_list(state)
 

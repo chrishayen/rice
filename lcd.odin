@@ -8,7 +8,7 @@ import "core:os"
 import "core:strings"
 import "core:strconv"
 
-// import des "libs/des"  // TODO: Enable when des library is available
+import des "libs/des"
 
 // USB Device IDs for Lian Li SL-LCD wired controller
 VID_WIRED :: 0x1cbe
@@ -93,9 +93,9 @@ get_timestamp_ms :: proc() -> u32 {
 	return u32(ms)
 }
 
-// Generate encrypted LCD header using native Odin DES-CBC implementation
+// Generate encrypted LCD header matching Python protocol exactly
 generate_lcd_header :: proc(jpeg_size: u32, command: LCD_Command = .JPEG, allocator := context.allocator) -> (header: [HEADER_SIZE]u8, ok: bool) {
-	// Manual header structure (plaintext)
+	// Python uses 504-byte plaintext buffer
 	plaintext: [504]u8
 
 	// Byte 0: Command
@@ -120,28 +120,25 @@ generate_lcd_header :: proc(jpeg_size: u32, command: LCD_Command = .JPEG, alloca
 
 	// Bytes 12-503: zeros (already initialized)
 
-	// TODO: Enable DES encryption when des library is available
-	// Pad to 512 bytes using PKCS7
-	// padded := des.pkcs7_pad(plaintext[:], des.DES_BLOCK_SIZE, allocator)
-	// defer delete(padded, allocator)
+	// Pad to 512 bytes using PKCS7 padding (504 bytes + 8 bytes padding = 512)
+	padded := des.pkcs7_pad(plaintext[:], des.DES_BLOCK_SIZE, allocator)
+	defer delete(padded, allocator)
 
-	// Encrypt with DES-CBC
-	// encrypted := make([]u8, len(padded), allocator)
-	// defer delete(encrypted, allocator)
+	// Encrypt with DES-CBC (encrypts all 512 bytes)
+	encrypted := make([]u8, len(padded), allocator)
+	defer delete(encrypted, allocator)
 
-	// des.des_cbc_encrypt(padded, encrypted, DES_KEY[:], DES_IV[:])
+	des.des_cbc_encrypt(padded, encrypted, DES_KEY[:], DES_IV[:])
 
-	// Copy to output header
-	// copy(header[:], encrypted)
-
-	// Temporary: Return unencrypted header (padded with zeros to 512 bytes)
-	copy(header[:len(plaintext)], plaintext[:])
+	// Copy encrypted 512-byte header to result
+	copy(header[:], encrypted)
 
 	return header, true
 }
 
-// Build complete frame (header + JPEG + padding)
+// Build complete frame (header + JPEG) - exactly 102,400 bytes like Python
 build_lcd_frame :: proc(jpeg_data: []u8, allocator := context.allocator) -> (frame: []u8, err: LCD_Error) {
+	// Check if JPEG data is too large
 	if len(jpeg_data) > MAX_JPEG_SIZE {
 		return nil, .Invalid_JPEG_Size
 	}
@@ -152,22 +149,16 @@ build_lcd_frame :: proc(jpeg_data: []u8, allocator := context.allocator) -> (fra
 		return nil, .Encryption_Failed
 	}
 
-	// Allocate frame
+	// Allocate exactly FRAME_SIZE (102,400 bytes)
 	frame = make([]u8, FRAME_SIZE, allocator)
 
-	// Copy header
+	// Copy header (512 bytes)
 	copy(frame[0:HEADER_SIZE], header[:])
 
-	// Copy JPEG data
+	// Copy JPEG data (up to MAX_JPEG_SIZE = 101,888 bytes)
 	copy(frame[HEADER_SIZE:HEADER_SIZE + len(jpeg_data)], jpeg_data)
 
-	// Rest is already zero-padded (make() initializes to zero)
-
-	// Verify size
-	if len(frame) != FRAME_SIZE {
-		delete(frame)
-		return nil, .Invalid_Frame_Size
-	}
+	// Remaining bytes are already zero-initialized
 
 	return frame, .None
 }
@@ -195,7 +186,7 @@ send_lcd_frame :: proc(dev: ^LCD_Device, jpeg_data: []u8) -> LCD_Error {
 		return .USB_Transfer_Failed
 	}
 
-	if bytes_transferred != FRAME_SIZE {
+	if bytes_transferred != c.int(len(frame)) {
 		return .Send_Failed
 	}
 
@@ -295,38 +286,33 @@ stop_lcd_playback :: proc(dev: ^LCD_Device) -> LCD_Error {
 }
 
 // Initialize LCD device
+// If bus and device_addr are both 0, finds the first LCD device
 init_lcd_device :: proc(bus: int, device_addr: int) -> (dev: LCD_Device, err: LCD_Error) {
-	// Initialize libusb
-	ret := libusb_init(&dev.ctx)
-	if ret != LIBUSB_SUCCESS {
+	// Use shared USB context
+	ctx, ctx_err := get_usb_context()
+	if ctx_err {
 		return dev, .USB_Init_Failed
 	}
+	dev.ctx = ctx
 
 	// Get device list
 	device_list: ^rawptr
 	device_count := libusb_get_device_list(dev.ctx, &device_list)
 	if device_count < 0 {
-		libusb_exit(dev.ctx)
+		release_usb_context()
 		return dev, .USB_Init_Failed
 	}
 	defer libusb_free_device_list(device_list, 1)
 
 	// Find matching device
+	find_any := (bus == 0 && device_addr == 0)
 	found := false
 	for i in 0..<device_count {
 		device := mem.ptr_offset(device_list, i)^
 
-		// Check bus and address
-		dev_bus := libusb_get_bus_number(device)
-		dev_addr := libusb_get_device_address(device)
-
-		if int(dev_bus) != bus || int(dev_addr) != device_addr {
-			continue
-		}
-
-		// Check VID/PID
+		// Check VID/PID first
 		desc: Device_Descriptor
-		ret = libusb_get_device_descriptor(device, &desc)
+		ret := libusb_get_device_descriptor(device, &desc)
 		if ret != LIBUSB_SUCCESS {
 			continue
 		}
@@ -335,10 +321,20 @@ init_lcd_device :: proc(bus: int, device_addr: int) -> (dev: LCD_Device, err: LC
 			continue
 		}
 
+		// Check bus and address if specified
+		if !find_any {
+			dev_bus := libusb_get_bus_number(device)
+			dev_addr := libusb_get_device_address(device)
+
+			if int(dev_bus) != bus || int(dev_addr) != device_addr {
+				continue
+			}
+		}
+
 		// Open device
 		ret = libusb_open(device, &dev.usb_handle)
 		if ret != LIBUSB_SUCCESS {
-			libusb_exit(dev.ctx)
+			release_usb_context()
 			return dev, .USB_Open_Failed
 		}
 
@@ -347,25 +343,25 @@ init_lcd_device :: proc(bus: int, device_addr: int) -> (dev: LCD_Device, err: LC
 	}
 
 	if !found {
-		libusb_exit(dev.ctx)
+		release_usb_context()
 		return dev, .Device_Not_Found
 	}
 
 	// Detach kernel driver if active
 	if libusb_kernel_driver_active(dev.usb_handle, 0) == 1 {
-		ret = libusb_detach_kernel_driver(dev.usb_handle, 0)
+		ret := libusb_detach_kernel_driver(dev.usb_handle, 0)
 		if ret != LIBUSB_SUCCESS {
 			libusb_close(dev.usb_handle)
-			libusb_exit(dev.ctx)
+			release_usb_context()
 			return dev, .Kernel_Driver_Error
 		}
 	}
 
 	// Set configuration
-	ret = libusb_set_configuration(dev.usb_handle, 1)
+	ret := libusb_set_configuration(dev.usb_handle, 1)
 	if ret != LIBUSB_SUCCESS {
 		libusb_close(dev.usb_handle)
-		libusb_exit(dev.ctx)
+		release_usb_context()
 		return dev, .USB_Claim_Interface_Failed
 	}
 
@@ -373,7 +369,7 @@ init_lcd_device :: proc(bus: int, device_addr: int) -> (dev: LCD_Device, err: LC
 	ret = libusb_claim_interface(dev.usb_handle, 0)
 	if ret != LIBUSB_SUCCESS {
 		libusb_close(dev.usb_handle)
-		libusb_exit(dev.ctx)
+		release_usb_context()
 		return dev, .USB_Claim_Interface_Failed
 	}
 
@@ -399,8 +395,8 @@ cleanup_lcd_device :: proc(dev: ^LCD_Device) {
 		dev.usb_handle = nil
 	}
 	if dev.ctx != nil {
-		// Exit libusb
-		libusb_exit(dev.ctx)
+		// Release shared USB context reference
+		release_usb_context()
 		dev.ctx = nil
 	}
 }

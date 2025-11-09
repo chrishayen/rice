@@ -5,6 +5,7 @@ package main
 import "core:c"
 import "core:encoding/json"
 import "core:fmt"
+import "core:mem"
 import "core:os"
 import "core:strconv"
 import "core:strings"
@@ -35,6 +36,8 @@ Service_State :: struct {
 	// Current effect packets for continuous broadcast
 	current_effect_packets: [dynamic]Device_Packet_Info,
 	effect_packets_mutex:  sync.Mutex,
+	// LCD playback
+	lcd_playback:          ^LCD_Playback_State,
 }
 
 run_service :: proc() {
@@ -142,6 +145,10 @@ run_service :: proc() {
 	log_debug("Starting effect broadcast thread...")
 	state.effect_broadcast_thread = thread.create_and_start_with_data(&state, effect_broadcast_thread)
 
+	// Initialize LCD playback (hardcoded test for first LCD device)
+	log_debug("Initializing LCD playback...")
+	init_lcd_playback_test(&state)
+
 	log_info("Service initialized successfully")
 	log_info("Press Ctrl+C to stop")
 	log_debug("Poll interval: %d seconds", state.poll_interval_seconds)
@@ -180,6 +187,12 @@ run_service :: proc() {
 
 	log_info("Service stopped")
 	log_debug("Cleanup complete")
+
+	// Cleanup LCD playback
+	if state.lcd_playback != nil {
+		log_debug("Stopping LCD playback...")
+		destroy_lcd_playback(state.lcd_playback)
+	}
 
 	// Wait for threads to finish
 	if state.master_poll_thread != nil {
@@ -1049,5 +1062,55 @@ handle_socket_message :: proc(client_fd: c.int, state: ^Service_State) {
 	case:
 		log_warn("Unknown message type: %v", msg.type)
 	}
+}
+
+// Initialize LCD playback test (hardcoded for first LCD device)
+init_lcd_playback_test :: proc(state: ^Service_State) {
+	// Wait a moment for devices to be discovered
+	time.sleep(2 * time.Second)
+
+	// Load device cache to get LCD devices
+	cache, err := load_device_cache()
+	if err != .None {
+		log_warn("Could not load device cache for LCD initialization: %v", err)
+		return
+	}
+	defer {
+		for entry in cache {
+			delete(entry.mac_str)
+			delete(entry.dev_type_name)
+		}
+		delete(cache)
+	}
+
+	// Get config directory path for frames
+	config_dir, config_err := get_config_dir()
+	if config_err != .None {
+		log_warn("Could not get config directory: %v", config_err)
+		return
+	}
+	defer delete(config_dir)
+
+	frames_dir := fmt.aprintf("%s/lcd_frames/bad_apple", config_dir)
+	defer delete(frames_dir)
+
+	// Disable image processing for now
+	transform := LCD_Transform{
+		zoom_percent = 0.0,
+	}
+
+	// Create LCD playback state (use bus 1, device 7)
+	playback, lcd_err := create_lcd_playback(1, 7, frames_dir, fps = 20.0, loop = true, transform = transform)
+	if lcd_err != .None {
+		log_error("Failed to create LCD playback: %v", lcd_err)
+		return
+	}
+
+	state.lcd_playback = playback
+	log_info("LCD playback initialized: %d frames at %.1f fps", len(playback.frame_paths), playback.fps)
+
+	// Start playback
+	start_lcd_playback(playback)
+	log_info("LCD playback started!")
 }
 

@@ -61,6 +61,10 @@
             //    // actually used.
             //    .lazy = false,
         },
+        .des = .{
+            .url = "https://github.com/chrishayen/des/archive/refs/heads/master.tar.gz",
+            .hash = "1220300061dcad67b8be4aad052656eb1b4d5c0e79ae6c58673969cf2ba86a776f8b",
+        },
     },
     // Specifies the set of files and directories that are included in this package.
     // Only files and directories listed here are included in the `hash` that
