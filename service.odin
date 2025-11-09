@@ -1104,14 +1104,21 @@ init_lcd_playback_test :: proc(state: ^Service_State) {
 		}
 	}
 
-	// Find first LCD device in cache to get MAC and load transform
+	// Find first LCD device and fan in cache to load transform
 	transform := LCD_Transform{zoom_percent = 35.0} // Default
 	for entry in cache {
 		if entry.has_lcd {
-			device_transform, transform_err := get_device_transform(entry.mac_str)
-			if transform_err == .None {
-				transform = device_transform
-				log_info("Loaded LCD transform for device %s", entry.mac_str)
+			// Find first LCD fan (type 24 or 25)
+			for fan_idx in 0..<int(entry.fan_num) {
+				fan_type := entry.fan_types[fan_idx]
+				if fan_type == 24 || fan_type == 25 {
+					fan_transform, transform_err := get_lcd_fan_transform(entry.mac_str, fan_idx)
+					if transform_err == .None {
+						transform = fan_transform
+						log_info("Loaded LCD transform for device %s fan %d", entry.mac_str, fan_idx)
+					}
+					break // Use first LCD fan found
+				}
 			}
 			break // Use first LCD device found
 		}

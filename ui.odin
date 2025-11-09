@@ -1222,13 +1222,14 @@ draw_lcd_preview :: proc "c" (
 
 // Load LCD preview from saved configuration
 load_lcd_preview_from_config :: proc(state: ^App_State, settings: App_Settings) {
-	// Load transform from device cache for selected device
+	// Load transform from LCD config for selected device and fan
 	transform := LCD_Transform{zoom_percent = 35.0} // Default
-	if state.selected_lcd_device >= 0 && state.selected_lcd_device < len(state.devices) {
+	if state.selected_lcd_device >= 0 && state.selected_lcd_device < len(state.devices) &&
+	   state.selected_lcd_fan >= 0 {
 		device := state.devices[state.selected_lcd_device]
-		device_transform, err := get_device_transform(device.mac_str)
+		fan_transform, err := get_lcd_fan_transform(device.mac_str, state.selected_lcd_fan)
 		if err == .None {
-			transform = device_transform
+			transform = fan_transform
 		}
 	}
 
@@ -1897,13 +1898,21 @@ on_lcd_transform_changed :: proc "c" (widget: rawptr, user_data: rawptr) {
 	// Update the state transform
 	state.lcd_preview_transform = transform
 
-	// Save to device cache for the selected device
-	if state.selected_lcd_device >= 0 && state.selected_lcd_device < len(state.devices) {
+	// Save to LCD config for the selected device and fan
+	if state.selected_lcd_device >= 0 && state.selected_lcd_device < len(state.devices) &&
+	   state.selected_lcd_fan >= 0 {
 		device := state.devices[state.selected_lcd_device]
-		save_err := update_device_transform(device.mac_str, transform)
+		save_err := update_lcd_fan_transform(device.mac_str, state.selected_lcd_fan, transform)
 		if save_err != .None {
-			fmt.printfln("Warning: Failed to save LCD transform for device %s: %v", device.mac_str, save_err)
+			fmt.printfln("Warning: Failed to save LCD transform for device %s fan %d: %v",
+				device.mac_str, state.selected_lcd_fan, save_err)
+		} else {
+			fmt.printfln("Saved LCD transform for device %s fan %d: zoom=%.1f%%",
+				device.mac_str, state.selected_lcd_fan, transform.zoom_percent)
 		}
+	} else {
+		fmt.printfln("Not saving transform: no device/fan selected (device=%d, fan=%d, len(devices)=%d)",
+			state.selected_lcd_device, state.selected_lcd_fan, len(state.devices))
 	}
 }
 
