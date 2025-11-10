@@ -36,8 +36,12 @@ Service_State :: struct {
 	// Current effect packets for continuous broadcast
 	current_effect_packets: [dynamic]Device_Packet_Info,
 	effect_packets_mutex:  sync.Mutex,
-	// LCD playback
-	lcd_playback:          ^LCD_Playback_State,
+	// LCD devices - all opened at startup (keyed by USB serial number)
+	lcd_devices:           map[string]LCD_Device,
+	lcd_devices_mutex:     sync.Mutex,
+	// LCD playback - one per device (keyed by USB serial number)
+	lcd_playbacks:         map[string]^LCD_Playback_State,
+	lcd_playbacks_mutex:   sync.Mutex,
 }
 
 run_service :: proc() {
@@ -78,6 +82,17 @@ run_service :: proc() {
 	state.devices_cache = make([dynamic]RF_Device_Info)
 	defer delete(state.devices_cache)
 
+	// Initialize LCD playbacks map
+	state.lcd_playbacks = make(map[string]^LCD_Playback_State)
+	defer {
+		// Cleanup all LCD playbacks
+		for sn, playback in state.lcd_playbacks {
+			destroy_lcd_playback(playback)
+			delete(sn) // Free the cloned serial number string key
+		}
+		delete(state.lcd_playbacks)
+	}
+
 	// Initialize LED device
 	led_dev, err := init_led_device()
 	if err != .None {
@@ -101,6 +116,20 @@ run_service :: proc() {
 	)
 	log_debug("Active channel: %d", state.led_device.active_channel)
 	log_debug("Firmware version: 0x%04x", state.led_device.fw_version)
+
+	// Initialize all LCD devices and keep them open
+	state.lcd_devices = make(map[string]LCD_Device)
+	defer {
+		// Cleanup all LCD devices
+		sync.mutex_lock(&state.lcd_devices_mutex)
+		for serial_number, &lcd_dev in state.lcd_devices {
+			cleanup_lcd_device(&lcd_dev)
+			delete(serial_number)
+		}
+		sync.mutex_unlock(&state.lcd_devices_mutex)
+		delete(state.lcd_devices)
+	}
+	init_all_lcd_devices(&state)
 
 	// Create socket server
 	log_info("Creating socket server...")
@@ -145,9 +174,10 @@ run_service :: proc() {
 	log_debug("Starting effect broadcast thread...")
 	state.effect_broadcast_thread = thread.create_and_start_with_data(&state, effect_broadcast_thread)
 
-	// Initialize LCD playback (hardcoded test for first LCD device)
-	log_debug("Initializing LCD playback...")
-	init_lcd_playback_test(&state)
+	// Auto-start configured LCD playbacks in background thread (non-blocking)
+	log_debug("Starting configured LCD playbacks...")
+	lcd_init_thread := thread.create_and_start_with_data(&state, init_configured_lcd_playbacks_thread)
+	// Don't wait for it - let it run in background
 
 	log_info("Service initialized successfully")
 	log_info("Press Ctrl+C to stop")
@@ -188,11 +218,7 @@ run_service :: proc() {
 	log_info("Service stopped")
 	log_debug("Cleanup complete")
 
-	// Cleanup LCD playback
-	if state.lcd_playback != nil {
-		log_debug("Stopping LCD playback...")
-		destroy_lcd_playback(state.lcd_playback)
-	}
+	// LCD playback cleanup handled by defer
 
 	// Wait for threads to finish
 	if state.master_poll_thread != nil {
@@ -237,6 +263,27 @@ master_polling_thread :: proc(data: rawptr) {
 	log_debug("Master polling thread stopped")
 }
 
+// Get LCD device serial number by index (for matching RF devices to USB devices)
+// Returns the Nth LCD device's serial number (empty string if not found)
+get_lcd_serial_by_index :: proc(lcd_devices: ^map[string]LCD_Device, target_index: int) -> string {
+	// Create sorted list of serial numbers for stable indexing
+	serials := make([dynamic]string, 0, len(lcd_devices))
+	defer delete(serials)
+
+	for serial_number, _ in lcd_devices {
+		append(&serials, serial_number)
+	}
+
+	// Sort to ensure consistent ordering
+	slice.sort(serials[:])
+
+	if target_index >= 0 && target_index < len(serials) {
+		return serials[target_index]
+	}
+
+	return ""
+}
+
 // Update device cache immediately (called after bind/unbind operations)
 refresh_device_cache :: proc(state: ^Service_State) {
 	log_debug("Refreshing device cache...")
@@ -273,7 +320,28 @@ refresh_device_cache :: proc(state: ^Service_State) {
 		defer delete(devices_slice)
 
 		for _, device in all_devices {
-			append(&devices_slice, device)
+			// Check if device has LCD fans (types 24 or 25)
+			has_lcd := false
+			for i in 0..<int(device.fan_num) {
+				if device.fan_types[i] == 24 || device.fan_types[i] == 25 {
+					has_lcd = true
+					break
+				}
+			}
+
+			// If device has LCD, try to find its USB serial number by rx_type index
+			device_with_sn := device
+			if has_lcd {
+				// Get Nth LCD device serial number (where N = rx_type)
+				sync.mutex_lock(&state.lcd_devices_mutex)
+				serial_number := get_lcd_serial_by_index(&state.lcd_devices, int(device.rx_type))
+				if serial_number != "" {
+					device_with_sn.usb_serial_number = strings.clone(serial_number)
+				}
+				sync.mutex_unlock(&state.lcd_devices_mutex)
+			}
+
+			append(&devices_slice, device_with_sn)
 		}
 
 		log_debug("Updating cache with %d devices", len(devices_slice))
@@ -1049,6 +1117,101 @@ handle_socket_message :: proc(client_fd: c.int, state: ^Service_State) {
 			log_warn("Failed to send Effect_Applied response: %v", send_err)
 		}
 
+	case .Start_LCD_Playback:
+		log_debug("Handling Start_LCD_Playback request")
+
+		// Parse request from JSON
+		lcd_req: Start_LCD_Playback_Request
+		payload_bytes := transmute([]u8)msg.payload
+		unmarshal_err := json.unmarshal(payload_bytes, &lcd_req)
+		if unmarshal_err != nil {
+			log_warn("Failed to unmarshal LCD playback request: %v", unmarshal_err)
+			error_msg := IPC_Message{type = .Error, payload = "Failed to parse request"}
+			send_message(client_fd, error_msg)
+			return
+		}
+		defer {
+			delete(lcd_req.serial_number)
+			delete(lcd_req.frames_dir)
+		}
+
+		log_info("Starting LCD playback for device SN=%s fan %d: %s (%.1f fps)",
+			lcd_req.serial_number, lcd_req.fan_index, lcd_req.frames_dir, lcd_req.fps)
+
+		// Look up LCD device in map
+		sync.mutex_lock(&state.lcd_devices_mutex)
+		lcd_device, device_found := &state.lcd_devices[lcd_req.serial_number]
+		sync.mutex_unlock(&state.lcd_devices_mutex)
+
+		if !device_found {
+			log_warn("LCD device %s not found", lcd_req.serial_number)
+			error_msg := IPC_Message{type = .Error, payload = "LCD device not found"}
+			send_message(client_fd, error_msg)
+			return
+		}
+
+		// Stop any existing LCD playback for this specific device
+		sync.mutex_lock(&state.lcd_playbacks_mutex)
+		existing_playback, has_existing := state.lcd_playbacks[lcd_req.serial_number]
+		old_sn_key := ""
+		if has_existing {
+			log_info("Stopping existing LCD playback for device %s", lcd_req.serial_number)
+			// Save old key to delete after removing from map
+			for sn, pb in state.lcd_playbacks {
+				if pb == existing_playback {
+					old_sn_key = sn
+					break
+				}
+			}
+			delete_key(&state.lcd_playbacks, lcd_req.serial_number)
+		}
+		sync.mutex_unlock(&state.lcd_playbacks_mutex)
+
+		// Destroy old playback outside the mutex lock
+		if has_existing {
+			destroy_lcd_playback(existing_playback)
+			if old_sn_key != "" {
+				delete(old_sn_key)
+			}
+		}
+
+		// Create new LCD playback state using already-open device
+		playback, lcd_err := create_lcd_playback(
+			lcd_device,
+			lcd_req.frames_dir,
+			fps = lcd_req.fps,
+			loop = true,
+			transform = lcd_req.transform,
+		)
+		if lcd_err != .None {
+			log_error("Failed to create LCD playback: %v", lcd_err)
+			error_msg := IPC_Message{type = .Error, payload = fmt.tprintf("Failed to create LCD playback: %v", lcd_err)}
+			send_message(client_fd, error_msg)
+			return
+		}
+
+		// Store playback in map
+		sync.mutex_lock(&state.lcd_playbacks_mutex)
+		state.lcd_playbacks[strings.clone(lcd_req.serial_number)] = playback
+		sync.mutex_unlock(&state.lcd_playbacks_mutex)
+
+		log_info("LCD playback created: %d frames", len(playback.frames.frame_paths))
+
+		// Start playback
+		start_lcd_playback(playback)
+		log_info("LCD playback started on device %s fan %d", lcd_req.serial_number, lcd_req.fan_index)
+
+		// Send success response
+		response := IPC_Message{
+			type = .LCD_Playback_Started,
+			payload = fmt.tprintf("%d frames at %.1f fps", len(playback.frames.frame_paths), lcd_req.fps),
+		}
+
+		send_err := send_message(client_fd, response)
+		if send_err != .None {
+			log_warn("Failed to send LCD_Playback_Started response: %v", send_err)
+		}
+
 	case .Ping:
 		log_debug("Handling Ping request")
 
@@ -1064,25 +1227,269 @@ handle_socket_message :: proc(client_fd: c.int, state: ^Service_State) {
 	}
 }
 
-// Initialize LCD playback test (hardcoded for first LCD device)
-init_lcd_playback_test :: proc(state: ^Service_State) {
-	// Wait a moment for devices to be discovered
-	time.sleep(2 * time.Second)
+// Initialize all LCD devices at startup
+// Opens all LCD devices and keeps them open for the session
+init_all_lcd_devices :: proc(state: ^Service_State) {
+	log_info("Initializing all LCD devices...")
 
-	// Load device cache to get LCD devices
-	cache, err := load_device_cache()
-	if err != .None {
-		log_warn("Could not load device cache for LCD initialization: %v", err)
+	// Use shared USB context
+	ctx, ctx_err := get_usb_context()
+	if ctx_err {
+		log_error("Failed to initialize USB context for LCD devices")
+		return
+	}
+	defer release_usb_context()
+
+	// Get device list
+	device_list: ^rawptr
+	device_count := libusb_get_device_list(ctx, &device_list)
+	if device_count < 0 {
+		log_error("Failed to get USB device list for LCD initialization")
+		return
+	}
+	defer libusb_free_device_list(device_list, 1)
+
+	// Enumerate all LCD devices (VID 0x1cbe, PID 0x0005)
+	found_count := 0
+	for i in 0..<device_count {
+		device := mem.ptr_offset(device_list, i)^
+
+		// Get device descriptor
+		desc: Device_Descriptor
+		ret := libusb_get_device_descriptor(device, &desc)
+		if ret != LIBUSB_SUCCESS {
+			continue
+		}
+
+		// Check if this is an LCD device
+		if desc.idVendor != VID_WIRED || desc.idProduct != PID_WIRED {
+			continue
+		}
+
+		// Open device
+		usb_handle: rawptr
+		ret = libusb_open(device, &usb_handle)
+		if ret != LIBUSB_SUCCESS {
+			log_warn("Failed to open LCD device (bus %d, addr %d): libusb error %d",
+				libusb_get_bus_number(device), libusb_get_device_address(device), ret)
+			continue
+		}
+
+		// Read serial number
+		serial_number := get_usb_serial_number(device, usb_handle)
+		if serial_number == "" {
+			log_warn("Failed to read serial number from LCD device (bus %d, addr %d)",
+				libusb_get_bus_number(device), libusb_get_device_address(device))
+			libusb_close(usb_handle)
+			continue
+		}
+
+		// Detach kernel driver if active
+		if libusb_kernel_driver_active(usb_handle, 0) == 1 {
+			ret = libusb_detach_kernel_driver(usb_handle, 0)
+			if ret != LIBUSB_SUCCESS {
+				log_warn("Failed to detach kernel driver for LCD device %s", serial_number)
+				delete(serial_number)
+				libusb_close(usb_handle)
+				continue
+			}
+		}
+
+		// Set configuration
+		ret = libusb_set_configuration(usb_handle, 1)
+		if ret != LIBUSB_SUCCESS {
+			log_warn("Failed to set configuration for LCD device %s", serial_number)
+			delete(serial_number)
+			libusb_close(usb_handle)
+			continue
+		}
+
+		// Claim interface
+		ret = libusb_claim_interface(usb_handle, 0)
+		if ret != LIBUSB_SUCCESS {
+			log_warn("Failed to claim interface for LCD device %s", serial_number)
+			delete(serial_number)
+			libusb_close(usb_handle)
+			continue
+		}
+
+		// Get USB context reference for this device (increments ref count)
+		device_ctx, device_ctx_err := get_usb_context()
+		if device_ctx_err {
+			log_warn("Failed to get USB context for LCD device %s", serial_number)
+			delete(serial_number)
+			libusb_release_interface(usb_handle, 0)
+			libusb_close(usb_handle)
+			continue
+		}
+
+		// Create LCD device structure
+		lcd_dev := LCD_Device{
+			ctx = device_ctx,
+			usb_handle = usb_handle,
+			ep_out = 0x01,  // OUT endpoint
+			ep_in = 0x81,   // IN endpoint
+			start_time_ms = u64(get_timestamp_ms()),
+		}
+
+		// Add to map
+		sync.mutex_lock(&state.lcd_devices_mutex)
+		state.lcd_devices[serial_number] = lcd_dev
+		sync.mutex_unlock(&state.lcd_devices_mutex)
+
+		log_info("  LCD Device %d: SN=%s (bus=%d, addr=%d)",
+			found_count, serial_number,
+			libusb_get_bus_number(device), libusb_get_device_address(device))
+
+		found_count += 1
+	}
+
+	log_info("Initialized %d LCD device(s)", found_count)
+}
+
+// Find USB LCD device by index (rx_type)
+// Returns (bus, address, ok)
+find_usb_lcd_device_by_index :: proc(target_index: int) -> (int, int, bool) {
+	// Initialize libusb
+	ctx: rawptr
+	ret := libusb_init(&ctx)
+	if ret != LIBUSB_SUCCESS {
+		log_warn("Failed to initialize libusb for LCD enumeration")
+		return 0, 0, false
+	}
+	defer libusb_exit(ctx)
+
+	// Get device list
+	device_list: ^rawptr
+	device_count := libusb_get_device_list(ctx, &device_list)
+	if device_count < 0 {
+		log_warn("Failed to get USB device list")
+		return 0, 0, false
+	}
+	defer libusb_free_device_list(device_list, 1)
+
+	// Enumerate all LCD devices (VID 0x1cbe, PID 0x0005)
+	index := 0
+	for i in 0..<device_count {
+		device := mem.ptr_offset(device_list, i)^
+
+		// Get device descriptor
+		desc: Device_Descriptor
+		ret = libusb_get_device_descriptor(device, &desc)
+		if ret != LIBUSB_SUCCESS {
+			continue
+		}
+
+		// Check if this is an LCD device
+		if desc.idVendor != VID_WIRED || desc.idProduct != PID_WIRED {
+			continue
+		}
+
+		// Check if this is the target index
+		if index == target_index {
+			bus := int(libusb_get_bus_number(device))
+			address := int(libusb_get_device_address(device))
+			return bus, address, true
+		}
+
+		index += 1
+	}
+
+	log_warn("USB LCD device at index %d not found (found %d LCD devices total)", target_index, index)
+	return 0, 0, false
+}
+
+// Thread wrapper for LCD playback initialization
+init_configured_lcd_playbacks_thread :: proc(data: rawptr) {
+	state := cast(^Service_State)data
+	init_configured_lcd_playbacks(state)
+}
+
+// Initialize all configured LCD playbacks on service startup
+init_configured_lcd_playbacks :: proc(state: ^Service_State) {
+	log_info("Loading LCD configuration for auto-start...")
+
+	// Load LCD configuration
+	lcd_config, config_err := load_lcd_config()
+	if config_err != .None {
+		log_warn("Could not load LCD configuration: %v", config_err)
 		return
 	}
 	defer {
-		for entry in cache {
-			delete(entry.mac_str)
-			delete(entry.dev_type_name)
+		for device in lcd_config.devices {
+			delete(device.serial_number)
+			for fan in device.fans {
+				delete(fan.frames_dir)
+			}
+			delete(device.fans)
 		}
-		delete(cache)
+		delete(lcd_config.devices)
 	}
 
+	// Track how many playbacks we start
+	started_count := 0
+
+	// For each configured device
+	for lcd_device in lcd_config.devices {
+		// Look up LCD device in map (all devices are already open)
+		sync.mutex_lock(&state.lcd_devices_mutex)
+		device_ptr, device_found := &state.lcd_devices[lcd_device.serial_number]
+		sync.mutex_unlock(&state.lcd_devices_mutex)
+
+		if !device_found {
+			log_warn("LCD device SN=%s not found, skipping", lcd_device.serial_number)
+			continue
+		}
+
+		// For each configured fan
+		for fan in lcd_device.fans {
+			// Skip if no frames directory configured
+			if fan.frames_dir == "" {
+				continue
+			}
+
+			// Check if frames directory exists
+			if !os.exists(fan.frames_dir) {
+				log_warn("Frames directory does not exist for device %s fan %d: %s", lcd_device.serial_number, fan.fan_index, fan.frames_dir)
+				continue
+			}
+
+			log_info("Auto-starting LCD playback for device SN=%s fan %d: %s", lcd_device.serial_number, fan.fan_index, fan.frames_dir)
+
+			// Create LCD playback using already-open device
+			playback, lcd_err := create_lcd_playback(
+				device_ptr,
+				fan.frames_dir,
+				fps = 20.0, // TODO: Make FPS configurable
+				loop = true,
+				transform = fan.transform,
+			)
+			if lcd_err != .None {
+				log_error("Failed to create LCD playback for device %s fan %d: %v", lcd_device.serial_number, fan.fan_index, lcd_err)
+				continue
+			}
+
+			// Store playback in map
+			sync.mutex_lock(&state.lcd_playbacks_mutex)
+			state.lcd_playbacks[strings.clone(lcd_device.serial_number)] = playback
+			sync.mutex_unlock(&state.lcd_playbacks_mutex)
+
+			// Start playback
+			start_lcd_playback(playback)
+			log_info("LCD playback started for device SN=%s fan %d (%d frames)", lcd_device.serial_number, fan.fan_index, len(playback.frames.frame_paths))
+			started_count += 1
+		}
+	}
+
+	if started_count > 0 {
+		log_info("Auto-started %d LCD playback(s)", started_count)
+	} else {
+		log_info("No LCD playbacks configured for auto-start")
+	}
+}
+
+// Initialize LCD playback test (hardcoded for first LCD device)
+init_lcd_playback_test :: proc(state: ^Service_State) {
 	// Get config directory path for frames
 	config_dir, config_err := get_config_dir()
 	if config_err != .None {
@@ -1094,50 +1501,45 @@ init_lcd_playback_test :: proc(state: ^Service_State) {
 	frames_dir := fmt.aprintf("%s/lcd_frames/bad_apple", config_dir)
 	defer delete(frames_dir)
 
-	// Load settings to get LCD device configuration
-	settings, settings_err := load_settings()
-	if settings_err != .None {
-		log_warn("Failed to load settings, using auto-detect: %v", settings_err)
-		settings = App_Settings{
-			lcd_device_bus = 0,
-			lcd_device_address = 0,
-		}
+	// Get first LCD device from map
+	sync.mutex_lock(&state.lcd_devices_mutex)
+	first_device_sn := ""
+	for sn, _ in state.lcd_devices {
+		first_device_sn = sn
+		break
+	}
+	if first_device_sn == "" {
+		sync.mutex_unlock(&state.lcd_devices_mutex)
+		log_warn("No LCD devices found for test")
+		return
+	}
+	device_ptr := &state.lcd_devices[first_device_sn]
+	sync.mutex_unlock(&state.lcd_devices_mutex)
+
+	// Load transform from config (try to load for this serial number, fan 0)
+	transform, transform_err := get_lcd_fan_transform(first_device_sn, 0)
+	if transform_err != .None {
+		transform = LCD_Transform{zoom_percent = 35.0} // Default
 	}
 
-	// Find first LCD device and fan in cache to load transform
-	transform := LCD_Transform{zoom_percent = 35.0} // Default
-	for entry in cache {
-		if entry.has_lcd {
-			// Find first LCD fan (type 24 or 25)
-			for fan_idx in 0..<int(entry.fan_num) {
-				fan_type := entry.fan_types[fan_idx]
-				if fan_type == 24 || fan_type == 25 {
-					fan_transform, transform_err := get_lcd_fan_transform(entry.mac_str, fan_idx)
-					if transform_err == .None {
-						transform = fan_transform
-						log_info("Loaded LCD transform for device %s fan %d", entry.mac_str, fan_idx)
-					}
-					break // Use first LCD fan found
-				}
-			}
-			break // Use first LCD device found
-		}
-	}
-
-	log_info("Using LCD device: bus=%d, address=%d", settings.lcd_device_bus, settings.lcd_device_address)
+	log_info("Using LCD device SN=%s", first_device_sn)
 	log_info("Using LCD transform: zoom=%.1f%%, rotation=%.1f deg, rotation_speed=%.1f deg/s",
 		transform.zoom_percent,
 		transform.rotate_degrees,
 		transform.rotation_speed)
 
-	// Create LCD playback state (load from configuration)
-	playback, lcd_err := create_lcd_playback(settings.lcd_device_bus, settings.lcd_device_address, frames_dir, fps = 20.0, loop = true, transform = transform)
+	// Create LCD playback state using already-open device
+	playback, lcd_err := create_lcd_playback(device_ptr, frames_dir, fps = 20.0, loop = true, transform = transform)
 	if lcd_err != .None {
 		log_error("Failed to create LCD playback: %v", lcd_err)
 		return
 	}
 
-	state.lcd_playback = playback
+	// Store in map
+	sync.mutex_lock(&state.lcd_playbacks_mutex)
+	state.lcd_playbacks[strings.clone(first_device_sn)] = playback
+	sync.mutex_unlock(&state.lcd_playbacks_mutex)
+
 	log_info("LCD playback initialized: %d frames at %.1f fps", len(playback.frames.frame_paths), playback.fps)
 
 	// Start playback

@@ -43,6 +43,7 @@ GtkFrame :: distinct rawptr
 GtkScrolledWindow :: distinct rawptr
 GtkDropDown :: distinct rawptr
 GtkStringList :: distinct rawptr
+GListModel :: distinct rawptr
 GApplication :: distinct rawptr
 GtkGesture :: distinct rawptr
 GtkGestureDrag :: distinct rawptr
@@ -193,10 +194,12 @@ foreign gtk {
 
 	gtk_string_list_new :: proc(strings: ^cstring) -> GtkStringList ---
 	gtk_string_list_append :: proc(list: GtkStringList, string: cstring) ---
+	gtk_string_list_remove :: proc(list: GtkStringList, position: c.uint) ---
 	gtk_drop_down_new :: proc(model: rawptr, expression: rawptr) -> GtkWidget ---
 	gtk_drop_down_set_selected :: proc(dropdown: GtkDropDown, position: c.uint) ---
 	gtk_drop_down_get_selected :: proc(dropdown: GtkDropDown) -> c.uint ---
 	gtk_drop_down_set_model :: proc(dropdown: GtkDropDown, model: rawptr) ---
+	gtk_drop_down_get_model :: proc(dropdown: GtkDropDown) -> GListModel ---
 
 	gtk_gesture_drag_new :: proc() -> GtkGesture ---
 	gtk_gesture_click_new :: proc() -> GtkGestureClick ---
@@ -249,6 +252,7 @@ foreign adw {
 @(default_calling_convention = "c")
 foreign gio {
 	g_application_run :: proc(app: GApplication, argc: c.int, argv: rawptr) -> c.int ---
+	g_list_model_get_n_items :: proc(list: GListModel) -> c.uint ---
 }
 
 GSignalMatchType :: enum c.uint {
@@ -353,18 +357,14 @@ App_State :: struct {
 	batch_selecting:       bool,
 
 	// LCD display controls
-	lcd_fan_dropdown:      GtkDropDown,
-	lcd_preview_area:      GtkDrawingArea,
-	selected_lcd_device:   int,  // Index into devices array, -1 if none selected
-	selected_lcd_fan:      int,  // Fan index within the device, -1 if none selected
-	usb_lcd_devices:       [dynamic]USB_LCD_Device,  // USB LCD devices indexed by rx_type
-
-	// LCD transform controls
-	lcd_zoom_scale:        GtkScale,
-	lcd_rotation_scale:    GtkScale,
-	lcd_rot_speed_scale:   GtkScale,
-	lcd_rot_dir_dropdown:  GtkDropDown,
-	lcd_flip_switch:       GtkCheckButton,
+	lcd_fan_dropdown:         GtkDropDown,
+	lcd_frames_dropdown:      GtkDropDown,
+	lcd_frames_row:           AdwActionRow,  // Row containing frames selection, for updating subtitle
+	lcd_preview_area:         GtkDrawingArea,
+	selected_lcd_device:      int,  // Index into devices array, -1 if none selected
+	selected_lcd_fan:         int,  // Fan index within the device, -1 if none selected
+	available_frame_sequences: [dynamic]string,  // List of discovered frame sequences
+	usb_lcd_devices:          [dynamic]USB_LCD_Device,  // USB LCD devices indexed by rx_type
 
 	// LCD preview rendering
 	lcd_raylib_processor:   LCD_Raylib_Processor,  // Raylib processor for preview
@@ -872,202 +872,41 @@ build_lcd_controls :: proc(state: ^App_State) -> GtkWidget {
 	// Video Source group
 	source_group := auto_cast adw_preferences_group_new()
 	adw_preferences_group_set_title(auto_cast source_group, "Video Source")
-	adw_preferences_group_set_description(auto_cast source_group, "Select frames directory for video playback")
+	adw_preferences_group_set_description(auto_cast source_group, "Select frame sequence for video playback")
 	gtk_box_append(auto_cast box, source_group)
 
-	// Frames directory row
-	frames_row := auto_cast adw_action_row_new()
-	adw_preferences_row_set_title(frames_row, "Frames Directory")
-	adw_action_row_set_subtitle(auto_cast frames_row, "No directory selected")
+	// Frame sequence selection row
+	state.lcd_frames_row = auto_cast adw_action_row_new()
+	adw_preferences_row_set_title(state.lcd_frames_row, "Frame Sequence")
+	adw_action_row_set_subtitle(state.lcd_frames_row, "No sequence selected")
 
-	browse_btn := auto_cast gtk_button_new_with_label("Browse...")
-	adw_action_row_add_suffix(auto_cast frames_row, browse_btn)
-	adw_preferences_group_add(auto_cast source_group, frames_row)
+	// Create dropdown for frame sequences
+	frames_list := gtk_string_list_new(nil)
+	gtk_string_list_append(frames_list, "Select a sequence...")
+	state.lcd_frames_dropdown = auto_cast gtk_drop_down_new(frames_list, nil)
+	gtk_drop_down_set_selected(state.lcd_frames_dropdown, 0)
+	gtk_widget_set_size_request(auto_cast state.lcd_frames_dropdown, 300, -1)
+	adw_action_row_add_suffix(state.lcd_frames_row, auto_cast state.lcd_frames_dropdown)
+	adw_preferences_group_add(auto_cast source_group, auto_cast state.lcd_frames_row)
 
-	// Playback Settings group
-	playback_group := auto_cast adw_preferences_group_new()
-	adw_preferences_group_set_title(auto_cast playback_group, "Playback Settings")
-	gtk_box_append(auto_cast box, playback_group)
+	// Connect signal for dropdown selection changes
+	g_signal_connect_data(state.lcd_frames_dropdown, "notify::selected", auto_cast on_lcd_frames_selected, state, nil, 0)
 
-	// FPS row
-	fps_row := auto_cast adw_action_row_new()
-	adw_preferences_row_set_title(fps_row, "Frames Per Second")
-	fps_scale := auto_cast gtk_scale_new_with_range(.HORIZONTAL, 1, 60, 1)
-	gtk_range_set_value(fps_scale, 10)
-	gtk_scale_set_digits(auto_cast fps_scale, 0)
-	gtk_scale_set_draw_value(auto_cast fps_scale, true)
-	gtk_widget_set_hexpand(auto_cast fps_scale, true)
-	gtk_widget_set_size_request(auto_cast fps_scale, 200, -1)
-	adw_action_row_add_suffix(auto_cast fps_row, auto_cast fps_scale)
-	adw_preferences_group_add(auto_cast playback_group, fps_row)
+	// Populate frame sequences list (will be updated when LCD tab is shown)
+	populate_lcd_frame_sequences(state)
 
-	// Loop option row
-	loop_row := auto_cast adw_action_row_new()
-	adw_preferences_row_set_title(loop_row, "Loop Playback")
-	adw_action_row_set_subtitle(auto_cast loop_row, "Repeat video continuously")
-	loop_switch := auto_cast gtk_check_button_new()
-	gtk_check_button_set_active(auto_cast loop_switch, false)
-	adw_action_row_add_suffix(auto_cast loop_row, loop_switch)
-	adw_action_row_set_activatable_widget(auto_cast loop_row, loop_switch)
-	adw_preferences_group_add(auto_cast playback_group, loop_row)
-
-	// Random start row
-	random_row := auto_cast adw_action_row_new()
-	adw_preferences_row_set_title(random_row, "Random Start")
-	adw_action_row_set_subtitle(auto_cast random_row, "Begin at random frame")
-	random_switch := auto_cast gtk_check_button_new()
-	gtk_check_button_set_active(auto_cast random_switch, false)
-	adw_action_row_add_suffix(auto_cast random_row, random_switch)
-	adw_action_row_set_activatable_widget(auto_cast random_row, random_switch)
-	adw_preferences_group_add(auto_cast playback_group, random_row)
-
-	// Transform Options group
-	transform_group := auto_cast adw_preferences_group_new()
-	adw_preferences_group_set_title(auto_cast transform_group, "Transform Options")
-	gtk_box_append(auto_cast box, transform_group)
-
-	// Zoom row
-	zoom_row := auto_cast adw_action_row_new()
-	adw_preferences_row_set_title(zoom_row, "Zoom (Center Crop)")
-	state.lcd_zoom_scale = auto_cast gtk_scale_new_with_range(.HORIZONTAL, 0, 90, 1)
-	gtk_range_set_value(auto_cast state.lcd_zoom_scale, 0)
-	gtk_scale_set_digits(state.lcd_zoom_scale, 0)
-	gtk_scale_set_draw_value(state.lcd_zoom_scale, true)
-	gtk_widget_set_hexpand(auto_cast state.lcd_zoom_scale, true)
-	gtk_widget_set_size_request(auto_cast state.lcd_zoom_scale, 200, -1)
-	g_signal_connect_data(state.lcd_zoom_scale, "value-changed", auto_cast on_lcd_transform_changed, state, nil, 0)
-	adw_action_row_add_suffix(auto_cast zoom_row, auto_cast state.lcd_zoom_scale)
-	adw_preferences_group_add(auto_cast transform_group, zoom_row)
-
-	// Rotation row
-	rotation_row := auto_cast adw_action_row_new()
-	adw_preferences_row_set_title(rotation_row, "Rotation (degrees)")
-	state.lcd_rotation_scale = auto_cast gtk_scale_new_with_range(.HORIZONTAL, 0, 360, 1)
-	gtk_range_set_value(auto_cast state.lcd_rotation_scale, 0)
-	gtk_scale_set_digits(state.lcd_rotation_scale, 0)
-	gtk_scale_set_draw_value(state.lcd_rotation_scale, true)
-	gtk_widget_set_hexpand(auto_cast state.lcd_rotation_scale, true)
-	gtk_widget_set_size_request(auto_cast state.lcd_rotation_scale, 200, -1)
-	g_signal_connect_data(state.lcd_rotation_scale, "value-changed", auto_cast on_lcd_transform_changed, state, nil, 0)
-	adw_action_row_add_suffix(auto_cast rotation_row, auto_cast state.lcd_rotation_scale)
-	adw_preferences_group_add(auto_cast transform_group, rotation_row)
-
-	// Rotation speed row
-	rot_speed_row := auto_cast adw_action_row_new()
-	adw_preferences_row_set_title(rot_speed_row, "Rotation Speed (deg/frame)")
-	state.lcd_rot_speed_scale = auto_cast gtk_scale_new_with_range(.HORIZONTAL, 0, 10, 0.1)
-	gtk_range_set_value(auto_cast state.lcd_rot_speed_scale, 0)
-	gtk_scale_set_digits(state.lcd_rot_speed_scale, 1)
-	gtk_scale_set_draw_value(state.lcd_rot_speed_scale, true)
-	gtk_widget_set_hexpand(auto_cast state.lcd_rot_speed_scale, true)
-	gtk_widget_set_size_request(auto_cast state.lcd_rot_speed_scale, 200, -1)
-	g_signal_connect_data(state.lcd_rot_speed_scale, "value-changed", auto_cast on_lcd_transform_changed, state, nil, 0)
-	adw_action_row_add_suffix(auto_cast rot_speed_row, auto_cast state.lcd_rot_speed_scale)
-	adw_preferences_group_add(auto_cast transform_group, rot_speed_row)
-
-	// Rotation direction row
-	rot_dir_row := auto_cast adw_action_row_new()
-	adw_preferences_row_set_title(rot_dir_row, "Rotation Direction")
-	rot_dir_list := gtk_string_list_new(nil)
-	gtk_string_list_append(rot_dir_list, "Counter-Clockwise")
-	gtk_string_list_append(rot_dir_list, "Clockwise")
-	state.lcd_rot_dir_dropdown = auto_cast gtk_drop_down_new(rot_dir_list, nil)
-	gtk_drop_down_set_selected(state.lcd_rot_dir_dropdown, 0)
-	g_signal_connect_data(state.lcd_rot_dir_dropdown, "notify::selected", auto_cast on_lcd_transform_changed, state, nil, 0)
-	adw_action_row_add_suffix(auto_cast rot_dir_row, auto_cast state.lcd_rot_dir_dropdown)
-	adw_preferences_group_add(auto_cast transform_group, rot_dir_row)
-
-	// Flip horizontal row
-	flip_row := auto_cast adw_action_row_new()
-	adw_preferences_row_set_title(flip_row, "Flip Horizontal")
-	state.lcd_flip_switch = auto_cast gtk_check_button_new()
-	gtk_check_button_set_active(state.lcd_flip_switch, false)
-	g_signal_connect_data(state.lcd_flip_switch, "toggled", auto_cast on_lcd_transform_changed, state, nil, 0)
-	adw_action_row_add_suffix(auto_cast flip_row, auto_cast state.lcd_flip_switch)
-	adw_action_row_set_activatable_widget(auto_cast flip_row, auto_cast state.lcd_flip_switch)
-	adw_preferences_group_add(auto_cast transform_group, flip_row)
-
-	// Overlay Options group
-	overlay_group := auto_cast adw_preferences_group_new()
-	adw_preferences_group_set_title(auto_cast overlay_group, "Overlay Options")
-	gtk_box_append(auto_cast box, overlay_group)
-
-	// Overlay type row
-	overlay_row := auto_cast adw_action_row_new()
-	adw_preferences_row_set_title(overlay_row, "Overlay Type")
-	overlay_list := gtk_string_list_new(nil)
-	gtk_string_list_append(overlay_list, "None")
-	gtk_string_list_append(overlay_list, "CPU Usage")
-	gtk_string_list_append(overlay_list, "GPU Usage")
-	gtk_string_list_append(overlay_list, "Memory Usage")
-	gtk_string_list_append(overlay_list, "CPU Temperature")
-	gtk_string_list_append(overlay_list, "Time")
-	gtk_string_list_append(overlay_list, "FPS Counter")
-	overlay_dropdown := auto_cast gtk_drop_down_new(overlay_list, nil)
-	gtk_drop_down_set_selected(auto_cast overlay_dropdown, 0)
-	adw_action_row_add_suffix(auto_cast overlay_row, auto_cast overlay_dropdown)
-	adw_preferences_group_add(auto_cast overlay_group, overlay_row)
-
-	// Colorful text row
-	colorful_row := auto_cast adw_action_row_new()
-	adw_preferences_row_set_title(colorful_row, "Colorful Text")
-	adw_action_row_set_subtitle(auto_cast colorful_row, "Use colored text (green/yellow/red)")
-	colorful_switch := auto_cast gtk_check_button_new()
-	gtk_check_button_set_active(auto_cast colorful_switch, false)
-	adw_action_row_add_suffix(auto_cast colorful_row, colorful_switch)
-	adw_action_row_set_activatable_widget(auto_cast colorful_row, colorful_switch)
-	adw_preferences_group_add(auto_cast overlay_group, colorful_row)
-
-	// Dark bar row
-	darkbar_row := auto_cast adw_action_row_new()
-	adw_preferences_row_set_title(darkbar_row, "Dark Bar Background")
-	adw_action_row_set_subtitle(auto_cast darkbar_row, "Add dark translucent bar behind text")
-	darkbar_switch := auto_cast gtk_check_button_new()
-	gtk_check_button_set_active(auto_cast darkbar_switch, false)
-	adw_action_row_add_suffix(auto_cast darkbar_row, darkbar_switch)
-	adw_action_row_set_activatable_widget(auto_cast darkbar_row, darkbar_switch)
-	adw_preferences_group_add(auto_cast overlay_group, darkbar_row)
-
-	// Bedtime hour row (for time overlay)
-	bedtime_row := auto_cast adw_action_row_new()
-	adw_preferences_row_set_title(bedtime_row, "Bedtime Hour (24h)")
-	adw_action_row_set_subtitle(auto_cast bedtime_row, "For time overlay color zones")
-	bedtime_scale := auto_cast gtk_scale_new_with_range(.HORIZONTAL, 0, 23, 1)
-	gtk_range_set_value(bedtime_scale, 22)
-	gtk_scale_set_digits(auto_cast bedtime_scale, 0)
-	gtk_scale_set_draw_value(auto_cast bedtime_scale, true)
-	gtk_widget_set_hexpand(auto_cast bedtime_scale, true)
-	gtk_widget_set_size_request(auto_cast bedtime_scale, 200, -1)
-	adw_action_row_add_suffix(auto_cast bedtime_row, auto_cast bedtime_scale)
-	adw_preferences_group_add(auto_cast overlay_group, bedtime_row)
-
-	// Show volume row
-	volume_row := auto_cast adw_action_row_new()
-	adw_preferences_row_set_title(volume_row, "Show Volume Changes")
-	adw_action_row_set_subtitle(auto_cast volume_row, "Display volume bar on changes")
-	volume_switch := auto_cast gtk_check_button_new()
-	gtk_check_button_set_active(auto_cast volume_switch, false)
-	adw_action_row_add_suffix(auto_cast volume_row, volume_switch)
-	adw_action_row_set_activatable_widget(auto_cast volume_row, volume_switch)
-	adw_preferences_group_add(auto_cast overlay_group, volume_row)
-
-	// Action buttons
+	// Action button
 	button_box := auto_cast gtk_box_new(.HORIZONTAL, 12)
 	gtk_widget_set_halign(button_box, .CENTER)
 	gtk_widget_set_margin_top(button_box, 20)
 	gtk_box_append(auto_cast box, button_box)
 
-	play_btn := auto_cast gtk_button_new_with_label("Play Video")
-	gtk_widget_add_css_class(play_btn, "suggested-action")
-	gtk_widget_add_css_class(play_btn, "pill")
-	gtk_widget_set_size_request(play_btn, 150, 48)
-	gtk_box_append(auto_cast button_box, play_btn)
-
-	stop_btn := auto_cast gtk_button_new_with_label("Stop")
-	gtk_widget_add_css_class(stop_btn, "destructive-action")
-	gtk_widget_add_css_class(stop_btn, "pill")
-	gtk_widget_set_size_request(stop_btn, 150, 48)
-	gtk_box_append(auto_cast button_box, stop_btn)
+	apply_btn := auto_cast gtk_button_new_with_label("Apply to Device")
+	gtk_widget_add_css_class(apply_btn, "suggested-action")
+	gtk_widget_add_css_class(apply_btn, "pill")
+	gtk_widget_set_size_request(apply_btn, 150, 48)
+	g_signal_connect_data(apply_btn, "clicked", auto_cast on_lcd_apply_clicked, state, nil, 0)
+	gtk_box_append(auto_cast button_box, apply_btn)
 
 	return scrolled
 }
@@ -1220,6 +1059,107 @@ draw_lcd_preview :: proc "c" (
 	cairo_stroke(cr)
 }
 
+// Scan for available frame sequences in ~/.config/rice/lcd_frames/
+populate_lcd_frame_sequences :: proc(state: ^App_State) {
+	// Clear existing sequences
+	for seq in state.available_frame_sequences {
+		delete(seq)
+	}
+	clear(&state.available_frame_sequences)
+
+	// Get config directory
+	config_dir, err := get_config_dir()
+	if err != .None {
+		fmt.eprintln("Failed to get config directory for frame sequences")
+		return
+	}
+	defer delete(config_dir)
+
+	frames_base_dir := fmt.aprintf("%s/lcd_frames", config_dir)
+	defer delete(frames_base_dir)
+
+	// Check if the base directory exists
+	if !os.exists(frames_base_dir) {
+		fmt.eprintfln("LCD frames directory does not exist: %s", frames_base_dir)
+		return
+	}
+
+	// Read directory contents
+	handle, open_err := os.open(frames_base_dir)
+	if open_err != 0 {
+		fmt.eprintfln("Failed to open LCD frames directory: %s", frames_base_dir)
+		return
+	}
+	defer os.close(handle)
+
+	file_infos, read_err := os.read_dir(handle, -1)
+	if read_err != 0 {
+		fmt.eprintfln("Failed to read LCD frames directory")
+		return
+	}
+	defer os.file_info_slice_delete(file_infos)
+
+	// Find subdirectories
+	for info in file_infos {
+		if info.is_dir {
+			// IMPORTANT: Must clone the string because filepath.base returns a slice
+			// into info.fullpath, which will be freed when file_infos is deleted
+			sequence_name := strings.clone(filepath.base(info.fullpath))
+			append(&state.available_frame_sequences, sequence_name)
+		}
+	}
+
+	// Update the dropdown list
+	if state.lcd_frames_dropdown != nil {
+		// Get the model
+		model := gtk_drop_down_get_model(state.lcd_frames_dropdown)
+		string_list := cast(GtkStringList)model
+
+		// Clear existing items (except the placeholder)
+		n_items := g_list_model_get_n_items(model)
+		for i := n_items - 1; i > 0; i -= 1 {
+			gtk_string_list_remove(string_list, c.uint(i))
+		}
+
+		// Add discovered sequences
+		for seq in state.available_frame_sequences {
+			cstr := strings.clone_to_cstring(seq)
+			defer delete(cstr)
+			gtk_string_list_append(string_list, cstr)
+		}
+	}
+
+	fmt.printfln("Found %d frame sequences", len(state.available_frame_sequences))
+}
+
+// Update LCD frames dropdown to match a given path
+update_lcd_frames_dropdown_from_path :: proc(state: ^App_State, frames_dir: string) {
+	if state.lcd_frames_dropdown == nil do return
+
+	// Extract sequence name from path (last component after lcd_frames/)
+	// Expected format: /path/to/.config/rice/lcd_frames/sequence_name
+	sequence_name := filepath.base(frames_dir)
+
+	// Find the sequence in our list
+	found_idx := -1
+	for seq, idx in state.available_frame_sequences {
+		if seq == sequence_name {
+			found_idx = idx
+			break
+		}
+	}
+
+	if found_idx >= 0 {
+		// Set dropdown to this sequence (add 1 for placeholder at index 0)
+		gtk_drop_down_set_selected(state.lcd_frames_dropdown, c.uint(found_idx + 1))
+
+		// Update subtitle
+		cstr := strings.clone_to_cstring(sequence_name)
+		defer delete(cstr)
+		adw_action_row_set_subtitle(state.lcd_frames_row, cstr)
+	}
+}
+
 // Load LCD preview from saved configuration
 load_lcd_preview_from_config :: proc(state: ^App_State, settings: App_Settings) {
 	// Load transform from LCD config for selected device and fan
@@ -1235,28 +1175,26 @@ load_lcd_preview_from_config :: proc(state: ^App_State, settings: App_Settings) 
 
 	state.lcd_preview_transform = transform
 
-	// Update UI controls to reflect the saved transform
-	if state.lcd_zoom_scale != nil {
-		gtk_range_set_value(auto_cast state.lcd_zoom_scale, f64(transform.zoom_percent))
-		gtk_range_set_value(auto_cast state.lcd_rotation_scale, f64(transform.rotate_degrees))
-		gtk_range_set_value(auto_cast state.lcd_rot_speed_scale, f64(transform.rotation_speed))
-		gtk_check_button_set_active(state.lcd_flip_switch, transform.flip_horizontal)
-		rot_dir_idx := transform.rotation_direction == .CCW ? 0 : 1
-		gtk_drop_down_set_selected(state.lcd_rot_dir_dropdown, c.uint(rot_dir_idx))
-	}
+	// Try to load frames from saved config
+	if state.selected_lcd_device >= 0 && state.selected_lcd_device < len(state.devices) &&
+	   state.selected_lcd_fan >= 0 {
+		device := state.devices[state.selected_lcd_device]
+		frames_dir, dir_err := get_lcd_fan_frames_dir(device.mac_str, state.selected_lcd_fan)
+		defer delete(frames_dir)
 
-	// Try to load frames from config directory
-	config_dir, err := get_config_dir()
-	if err != .None do return
-	defer delete(config_dir)
+		if dir_err == .None && frames_dir != "" {
+			// Load frame list from saved directory
+			if load_preview_frames_list(state, frames_dir) {
+				// Start playback at 20 FPS
+				start_lcd_preview_playback(state, 20.0)
+				fmt.printfln("Loaded frames from saved config: %s", frames_dir)
 
-	frames_dir := fmt.aprintf("%s/lcd_frames/bad_apple", config_dir)
-	defer delete(frames_dir)
-
-	// Load frame list
-	if load_preview_frames_list(state, frames_dir) {
-		// Start playback at 20 FPS
-		start_lcd_preview_playback(state, 20.0)
+				// Update the UI to show which sequence is selected
+				update_lcd_frames_dropdown_from_path(state, frames_dir)
+			}
+		} else {
+			fmt.printfln("No frames directory saved for device %s fan %d", device.mac_str, state.selected_lcd_fan)
+		}
 	}
 }
 
@@ -1877,44 +1815,107 @@ on_lcd_fan_selected :: proc "c" (dropdown: GtkDropDown, pspec: rawptr, user_data
 	gtk_widget_queue_draw(auto_cast state.lcd_preview_area)
 }
 
-// Handler for LCD transform changes (zoom, rotation, etc.)
-on_lcd_transform_changed :: proc "c" (widget: rawptr, user_data: rawptr) {
+// Handler for frame sequence selection
+on_lcd_frames_selected :: proc "c" (dropdown: GtkDropDown, pspec: rawptr, user_data: rawptr) {
 	context = runtime.default_context()
 	state := cast(^App_State)user_data
 
-	if state.lcd_zoom_scale == nil do return
+	selected := int(gtk_drop_down_get_selected(dropdown))
 
-	// Read all transform values
-	transform: LCD_Transform
-	transform.zoom_percent = f32(gtk_range_get_value(auto_cast state.lcd_zoom_scale))
-	transform.rotate_degrees = f32(gtk_range_get_value(auto_cast state.lcd_rotation_scale))
-	transform.rotation_speed = f32(gtk_range_get_value(auto_cast state.lcd_rot_speed_scale))
-	transform.flip_horizontal = gtk_check_button_get_active(auto_cast state.lcd_flip_switch)
+	// Index 0 is the placeholder "Select a sequence..."
+	if selected == 0 || selected > len(state.available_frame_sequences) {
+		adw_action_row_set_subtitle(state.lcd_frames_row, "No sequence selected")
+		return
+	}
 
-	// Get rotation direction
-	rot_dir_selected := gtk_drop_down_get_selected(state.lcd_rot_dir_dropdown)
-	transform.rotation_direction = rot_dir_selected == 0 ? .CCW : .CW
+	// Get selected sequence name (accounting for placeholder at index 0)
+	sequence_name := state.available_frame_sequences[selected - 1]
 
-	// Update the state transform
-	state.lcd_preview_transform = transform
+	// Update subtitle to show selected sequence
+	cstr := strings.clone_to_cstring(sequence_name)
+	defer delete(cstr)
+	adw_action_row_set_subtitle(state.lcd_frames_row, cstr)
 
-	// Save to LCD config for the selected device and fan
-	if state.selected_lcd_device >= 0 && state.selected_lcd_device < len(state.devices) &&
-	   state.selected_lcd_fan >= 0 {
-		device := state.devices[state.selected_lcd_device]
-		save_err := update_lcd_fan_transform(device.mac_str, state.selected_lcd_fan, transform)
-		if save_err != .None {
-			fmt.printfln("Warning: Failed to save LCD transform for device %s fan %d: %v",
-				device.mac_str, state.selected_lcd_fan, save_err)
-		} else {
-			fmt.printfln("Saved LCD transform for device %s fan %d: zoom=%.1f%%",
-				device.mac_str, state.selected_lcd_fan, transform.zoom_percent)
-		}
+	// Get config directory and build full path
+	config_dir, err := get_config_dir()
+	if err != .None {
+		fmt.eprintln("Failed to get config directory")
+		return
+	}
+	defer delete(config_dir)
+
+	frames_dir := fmt.aprintf("%s/lcd_frames/%s", config_dir, sequence_name)
+	defer delete(frames_dir)
+
+	// Load frames and update preview
+	if load_preview_frames_list(state, frames_dir) {
+		// Start playback at 20 FPS to preview the frames
+		start_lcd_preview_playback(state, 20.0)
+		fmt.printfln("Loaded frame sequence: %s", sequence_name)
 	} else {
-		fmt.printfln("Not saving transform: no device/fan selected (device=%d, fan=%d, len(devices)=%d)",
-			state.selected_lcd_device, state.selected_lcd_fan, len(state.devices))
+		fmt.eprintfln("Failed to load frames from: %s", frames_dir)
 	}
 }
+
+// Handler for Apply button - saves config and starts playback on device
+on_lcd_apply_clicked :: proc "c" (button: GtkButton, user_data: rawptr) {
+	context = runtime.default_context()
+	state := cast(^App_State)user_data
+
+	// Check if we have a selected LCD fan
+	if state.selected_lcd_device < 0 || state.selected_lcd_fan < 0 {
+		fmt.eprintln("No LCD fan selected")
+		return
+	}
+
+	// Check if we have a selected frame sequence
+	selected_idx := int(gtk_drop_down_get_selected(state.lcd_frames_dropdown))
+	if selected_idx == 0 || selected_idx > len(state.available_frame_sequences) {
+		fmt.eprintln("No frame sequence selected")
+		return
+	}
+
+	sequence_name := state.available_frame_sequences[selected_idx - 1]
+	device := state.devices[state.selected_lcd_device]
+
+	// Get config directory and build full path
+	config_dir, err := get_config_dir()
+	if err != .None {
+		fmt.eprintln("Failed to get config directory")
+		return
+	}
+	defer delete(config_dir)
+
+	frames_dir := fmt.aprintf("%s/lcd_frames/%s", config_dir, sequence_name)
+	defer delete(frames_dir)
+
+	// Save frames directory to config for this device/fan
+	save_err := update_lcd_fan_frames_dir(device.mac_str, state.selected_lcd_fan, frames_dir)
+	if save_err != .None {
+		fmt.eprintfln("Failed to save LCD frames directory to config: %v", save_err)
+		return
+	}
+
+	fmt.printfln("Saved frames directory for device %s fan %d: %s",
+		device.mac_str, state.selected_lcd_fan, frames_dir)
+
+	// Send IPC command to service to start playback on the actual device
+	fmt.printfln("Sending LCD playback command to service...")
+	success := send_start_lcd_playback_request(
+		device.mac_str,
+		state.selected_lcd_fan,
+		frames_dir,
+		20.0, // FPS
+		state.lcd_preview_transform, // Use current transform settings
+	)
+
+	if success {
+		fmt.printfln("Successfully applied LCD configuration to device")
+	} else {
+		fmt.eprintfln("Failed to start LCD playback on device (check that service is running)")
+	}
+}
+
 
 // Get USB LCD device by rx_type (lcd_group index)
 get_usb_lcd_device :: proc(state: ^App_State, rx_type: u8) -> (USB_LCD_Device, bool) {
@@ -2291,6 +2292,85 @@ send_effect_request :: proc(devices: []Device, effect_idx: int, color1: GdkRGBA,
 	} else {
 		log_warn("Unexpected response type: %v", response.type)
 		fmt.printfln("Error: Unexpected response from service")
+	}
+}
+
+// TODO: Update to take serial_number once UI can map MAC to serial number
+send_start_lcd_playback_request :: proc(serial_number: string, fan_index: int, frames_dir: string, fps: f32, transform: LCD_Transform) -> bool {
+	// Get socket path
+	socket_path, path_err := get_socket_path()
+	defer delete(socket_path)
+
+	if path_err != .None {
+		log_warn("Failed to get socket path: %v", path_err)
+		fmt.eprintfln("Error: Could not get socket path")
+		return false
+	}
+
+	// Connect to service
+	client, connect_err := connect_to_server(socket_path)
+	defer close_client(&client)
+
+	if connect_err != .None {
+		log_warn("Failed to connect to service: %v (is service running?)", connect_err)
+		fmt.eprintfln("Error: Could not connect to service. Is the service running?")
+		return false
+	}
+
+	// Build LCD playback request
+	lcd_req := Start_LCD_Playback_Request{
+		serial_number = serial_number,
+		fan_index = fan_index,
+		frames_dir = frames_dir,
+		fps = fps,
+		transform = transform,
+	}
+
+	// Marshal to JSON
+	json_data, marshal_err := json.marshal(lcd_req)
+	if marshal_err != nil {
+		log_warn("Failed to marshal LCD playback request: %v", marshal_err)
+		fmt.eprintfln("Error: Failed to create request")
+		return false
+	}
+	defer delete(json_data)
+
+	// Send Start_LCD_Playback request
+	request := IPC_Message{
+		type = .Start_LCD_Playback,
+		payload = string(json_data),
+	}
+
+	send_err := send_message(client.socket_fd, request)
+	if send_err != .None {
+		log_warn("Failed to send Start_LCD_Playback request: %v", send_err)
+		fmt.eprintfln("Error: Failed to send request to service")
+		return false
+	}
+
+	log_debug("LCD playback request sent, waiting for response...")
+
+	// Wait for success response
+	response, recv_err := receive_message(client.socket_fd)
+	if recv_err != .None {
+		log_warn("Failed to receive LCD_Playback_Started response: %v", recv_err)
+		fmt.eprintfln("Error: Failed to receive response from service")
+		return false
+	}
+	defer delete(response.payload)
+
+	if response.type == .LCD_Playback_Started {
+		log_info("LCD playback started successfully: %s", response.payload)
+		fmt.printfln("LCD playback started successfully: %s", response.payload)
+		return true
+	} else if response.type == .Error {
+		log_warn("LCD playback start failed: %s", response.payload)
+		fmt.eprintfln("Error starting LCD playback: %s", response.payload)
+		return false
+	} else {
+		log_warn("Unexpected response type: %v", response.type)
+		fmt.eprintfln("Error: Unexpected response from service")
+		return false
 	}
 }
 

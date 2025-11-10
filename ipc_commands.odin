@@ -11,6 +11,7 @@ Message_Type :: enum {
 	Identify_Device,
 	Bind_Device,
 	Unbind_Device,
+	Start_LCD_Playback,
 	Ping,
 
 	// Service -> Client
@@ -20,6 +21,7 @@ Message_Type :: enum {
 	Identify_Success,
 	Bind_Success,
 	Unbind_Success,
+	LCD_Playback_Started,
 	Pong,
 	Error,
 }
@@ -93,4 +95,12 @@ Status_Info :: struct {
 	active_channel:  u8,
 	fw_version:      u16,
 	device_count:    int,
+}
+
+Start_LCD_Playback_Request :: struct {
+	serial_number: string,  // USB serial number to identify LCD device
+	fan_index:     int,
+	frames_dir:    string,
+	fps:           f32,
+	transform:     LCD_Transform,
 }

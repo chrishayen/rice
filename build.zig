@@ -132,17 +132,29 @@ pub fn build(b: *std.Build) !void {
     const run_step = b.step("run", "Run the app");
     run_step.dependOn(&run_cmd.step);
 
-    // Test step
-    const odin_test = b.addSystemCommand(&.{"odin"});
-    odin_test.addArgs(&.{
+    // Test step - test root directory
+    const odin_test_root = b.addSystemCommand(&.{"odin"});
+    odin_test_root.addArgs(&.{
+        "test",
+        ".",
+        "-o:speed",
+        "-define:ODIN_TEST_THREADS=1", // Run tests sequentially to avoid config file conflicts
+    });
+    odin_test_root.addArg(des_key_define);
+    odin_test_root.addArg(extra_linker_flag);
+
+    // Test step - test tests directory
+    const odin_test_tests = b.addSystemCommand(&.{"odin"});
+    odin_test_tests.addArgs(&.{
         "test",
         "tests",
         "-all-packages",
         "-o:speed",
     });
-    odin_test.addArg(des_key_define);
-    odin_test.addArg(extra_linker_flag);
+    odin_test_tests.addArg(des_key_define);
+    odin_test_tests.addArg(extra_linker_flag);
+    odin_test_tests.step.dependOn(&odin_test_root.step);
 
     const test_step = b.step("test", "Run tests");
-    test_step.dependOn(&odin_test.step);
+    test_step.dependOn(&odin_test_tests.step);
 }

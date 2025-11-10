@@ -9,12 +9,13 @@ import "core:os"
 import "core:path/filepath"
 import "core:slice"
 import "core:strings"
+import "core:sync/chan"
 import "core:thread"
 import "core:time"
 
 // LCD playback state for a single device
 LCD_Playback_State :: struct {
-	device:           LCD_Device,
+	device:           ^LCD_Device,             // Reference to device (owned by service, not playback)
 	frames:           LCD_Frame_List,          // Frame list from shared module
 	sequencer:        LCD_Animation_Sequencer, // Frame sequencing from shared module
 	fps:              f32,
@@ -23,19 +24,22 @@ LCD_Playback_State :: struct {
 	thread:           ^thread.Thread,
 	raylib_processor: LCD_Raylib_Processor,  // Raylib image processor
 	use_raylib:       bool,                   // Whether to use raylib processing
+	stop_chan:        chan.Chan(bool),        // Channel for signaling thread to stop
 }
 
-// Create a new playback state
-create_lcd_playback :: proc(bus: int, address: int, frames_dir: string, fps: f32 = 20.0, loop: bool = true, transform: LCD_Transform = {}, allocator := context.allocator) -> (^LCD_Playback_State, LCD_Error) {
+// Create a new playback state (device is already open and managed by service)
+create_lcd_playback :: proc(device: ^LCD_Device, frames_dir: string, fps: f32 = 20.0, loop: bool = true, transform: LCD_Transform = {}, allocator := context.allocator) -> (^LCD_Playback_State, LCD_Error) {
 	state := new(LCD_Playback_State, allocator)
 
-	// Initialize LCD device
-	device, err := init_lcd_device(bus, address)
-	if err != .None {
+	// Create stop channel for signaling thread shutdown
+	stop_chan, chan_err := chan.create(chan.Chan(bool), allocator)
+	if chan_err != .None {
 		free(state, allocator)
-		return nil, err
+		return nil, .Device_Not_Found
 	}
+	state.stop_chan = stop_chan
 
+	// Store reference to device (owned by service, not this playback)
 	state.device = device
 	state.fps = fps
 	state.transform = transform
@@ -44,7 +48,7 @@ create_lcd_playback :: proc(bus: int, address: int, frames_dir: string, fps: f32
 	// Enumerate frame files using shared module
 	frames, frames_ok := enumerate_lcd_frames(frames_dir, allocator)
 	if !frames_ok {
-		cleanup_lcd_device(&state.device)
+		chan.destroy(stop_chan)
 		free(state, allocator)
 		return nil, .Device_Not_Found
 	}
@@ -92,6 +96,13 @@ lcd_playback_thread :: proc(data: rawptr) {
 	start_time := time.now()
 
 	for state.running {
+		// Check for stop signal (non-blocking)
+		_, should_stop := chan.try_recv(state.stop_chan)
+		if should_stop {
+			fmt.println("Stop signal received, exiting playback thread")
+			break
+		}
+
 		// Get current frame and advance sequencer
 		frame_idx, should_continue := advance_frame(&state.sequencer)
 		if !should_continue do break // Playback ended (non-looping)
@@ -126,7 +137,7 @@ lcd_playback_thread :: proc(data: rawptr) {
 		}
 
 		// Send frame to LCD
-		send_err := send_lcd_frame(&state.device, final_frame_data)
+		send_err := send_lcd_frame(state.device, final_frame_data)
 		if send_err != .None {
 			fmt.printfln("Error sending frame %d: %v", frame_idx, send_err)
 		} else if frame_idx < 5 {
@@ -165,6 +176,9 @@ stop_lcd_playback_state :: proc(state: ^LCD_Playback_State) {
 
 	state.running = false
 
+	// Send stop signal via channel for immediate shutdown
+	chan.send(state.stop_chan, true)
+
 	if state.thread != nil {
 		thread.join(state.thread)
 		thread.destroy(state.thread)
@@ -173,15 +187,19 @@ stop_lcd_playback_state :: proc(state: ^LCD_Playback_State) {
 }
 
 // Cleanup playback state
+// NOTE: Device is NOT cleaned up here - it's owned by the service
 destroy_lcd_playback :: proc(state: ^LCD_Playback_State, allocator := context.allocator) {
 	stop_lcd_playback_state(state)
 
 	// Raylib processor cleanup is handled in thread defer
 
-	cleanup_lcd_device(&state.device)
+	// NOTE: Device is owned by service, not playback - don't cleanup here
 
 	// Cleanup frame list using shared module
 	destroy_frame_list(&state.frames, allocator)
+
+	// Destroy stop channel
+	chan.destroy(state.stop_chan)
 
 	free(state, allocator)
 }

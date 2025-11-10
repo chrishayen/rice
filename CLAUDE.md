@@ -5,3 +5,5 @@
 - sl 120 looks like this https://lian-li.com/wp-content/uploads/2020/11/UNI-FAN-black-rgbx1-front.jpg
 - run build and test after every change
 - device configuration is saved by the service at ~/.config/rice/devices.json
+- Prefer small functions. Each function should have a test.
+- Prefer early return to nested logic.

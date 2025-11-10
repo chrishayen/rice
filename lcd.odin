@@ -85,12 +85,11 @@ LCD_Error :: enum {
 	Invalid_JPEG_Size,
 }
 
-// Generate timestamp in milliseconds
+// Generate timestamp in milliseconds (Unix epoch)
 get_timestamp_ms :: proc() -> u32 {
 	now := time.now()
-	duration := time.since(time.Time{})
-	ms := i64(time.duration_milliseconds(duration))
-	return u32(ms)
+	unix_ns := time.to_unix_nanoseconds(now)
+	return u32(unix_ns / 1_000_000)
 }
 
 // Generate encrypted LCD header matching Python protocol exactly

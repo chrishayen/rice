@@ -76,14 +76,19 @@ enumerate_lcd_frames :: proc(
 
 // Cleanup frame list
 destroy_frame_list :: proc(list: ^LCD_Frame_List, allocator := context.allocator) {
+	if list == nil do return
+
 	if list.frames_dir != "" {
 		delete(list.frames_dir, allocator)
 	}
 
+	// Clean up frame paths - safe to call on zero-initialized or empty dynamic arrays
 	for path in list.frame_paths {
 		delete(path, allocator)
 	}
-	delete(list.frame_paths)
+	if cap(list.frame_paths) > 0 {
+		delete(list.frame_paths)
+	}
 }
 
 // Initialize animation sequencer

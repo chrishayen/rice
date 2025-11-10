@@ -104,6 +104,7 @@ RF_Device_Info :: struct {
 	cmd_seq: u8,
 	bound_to_us: bool,
 	is_unbound: bool,
+	usb_serial_number: string,  // USB serial number for LCD devices (empty if no LCD)
 }
 
 // Error types

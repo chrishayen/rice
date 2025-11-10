@@ -8,12 +8,17 @@ import "core:mem"
 import "core:math"
 import stbi "vendor:stb/image"
 
+LCD_Rotation_Direction :: enum {
+	CCW,
+	CW,
+}
+
 LCD_Transform :: struct {
 	zoom_percent:       f32,  // 0-90, crop center and scale up
 	rotate_degrees:     f32,  // Static rotation (not implemented yet)
 	flip_horizontal:    bool, // Horizontal flip (not implemented yet)
 	rotation_speed:     f32,  // Degrees to rotate per frame (animated, not implemented yet)
-	rotation_direction: enum { CCW, CW },
+	rotation_direction: LCD_Rotation_Direction,
 }
 
 // Manual image rotation using nearest neighbor sampling

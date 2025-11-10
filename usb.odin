@@ -1,6 +1,7 @@
 package main
 
 import "core:c"
+import "core:strings"
 
 // Foreign imports for libusb
 foreign import libusb "system:usb-1.0"
@@ -22,6 +23,7 @@ foreign libusb {
 	libusb_claim_interface :: proc(handle: rawptr, interface_number: c.int) -> c.int ---
 	libusb_release_interface :: proc(handle: rawptr, interface_number: c.int) ---
 	libusb_bulk_transfer :: proc(handle: rawptr, endpoint: u8, data: [^]u8, length: c.int, transferred: ^c.int, timeout: c.uint) -> c.int ---
+	libusb_get_string_descriptor_ascii :: proc(handle: rawptr, desc_index: u8, data: [^]u8, length: c.int) -> c.int ---
 }
 
 // libusb types
@@ -55,3 +57,30 @@ LIBUSB_ERROR_TIMEOUT :: -7
 // USB endpoint constants
 LIBUSB_ENDPOINT_IN :: 0x80
 LIBUSB_ENDPOINT_OUT :: 0x00
+
+// Get USB serial number from device
+// Returns empty string on failure
+get_usb_serial_number :: proc(device: rawptr, handle: rawptr, allocator := context.allocator) -> string {
+	// Get device descriptor to find serial number index
+	desc: Device_Descriptor
+	ret := libusb_get_device_descriptor(device, &desc)
+	if ret != LIBUSB_SUCCESS {
+		return ""
+	}
+
+	// Check if device has a serial number
+	if desc.iSerialNumber == 0 {
+		return ""
+	}
+
+	// Read serial number string
+	buffer: [256]u8
+	length := libusb_get_string_descriptor_ascii(handle, desc.iSerialNumber, raw_data(buffer[:]), 256)
+	if length < 0 {
+		return ""
+	}
+
+	// Convert to Odin string
+	return strings.clone_from_bytes(buffer[:length], allocator)
+}
+
