@@ -9,10 +9,11 @@ import "core:fmt"
 import "core:strings"
 
 // Get user-friendly device name from technical type name and LCD flag
-get_friendly_device_name :: proc(dev_type_name: string, has_lcd: bool) -> string {
+// Get friendly device name for LED devices (LCD-agnostic)
+get_friendly_device_name :: proc(dev_type_name: string) -> string {
 	// Check for specific types first
 	if dev_type_name == "LC217" {
-		return "Lian Li SL 120 LCD"
+		return "Lian Li SL 120"  // LED panel - don't show LCD
 	}
 	if dev_type_name == "TLV2Fan" {
 		return "Lian Li TL"
@@ -32,18 +33,15 @@ get_friendly_device_name :: proc(dev_type_name: string, has_lcd: bool) -> string
 
 	// Check for SLV3Fan variants (SLV3Fan, SLV3Fan_21, etc.)
 	if strings.has_prefix(dev_type_name, "SLV3Fan") {
-		if has_lcd {
-			return "Lian Li SL 120 LCD"
-		}
-		return "Lian Li SL 120"
+		return "Lian Li SL 120"  // LED-only panel, no LCD distinction
 	}
 
 	// Default: return original name
 	return dev_type_name
 }
 
-// Build a device card widget
-build_device_card :: proc(device: Device, state: ^App_State, device_idx: int) -> GtkWidget {
+// Build a LED device card widget (LED-only, no LCD awareness)
+build_device_card :: proc(led_device: UI_LED_Device, state: ^App_State, device_idx: int) -> GtkWidget {
 	// Create a toggle button so the device card is selectable
 	button := auto_cast gtk_toggle_button_new()
 	gtk_widget_add_css_class(button, "card")
@@ -71,7 +69,7 @@ build_device_card :: proc(device: Device, state: ^App_State, device_idx: int) ->
 	gtk_box_append(auto_cast main_box, header_box)
 
 	// Device type name (bold) - map technical name to user-friendly product name
-	friendly_name := get_friendly_device_name(device.dev_type_name, device.has_lcd)
+	friendly_name := get_friendly_device_name(led_device.dev_type_name)
 	name_cstr := strings.clone_to_cstring(friendly_name)
 	defer delete(name_cstr)
 	name_label := auto_cast gtk_label_new(name_cstr)
@@ -84,7 +82,7 @@ build_device_card :: proc(device: Device, state: ^App_State, device_idx: int) ->
 	gtk_box_append(auto_cast header_box, name_label)
 
 	// MAC address (smaller, gray)
-	mac_cstr := strings.clone_to_cstring(device.mac_str)
+	mac_cstr := strings.clone_to_cstring(led_device.mac_str)
 	defer delete(mac_cstr)
 	mac_label := auto_cast gtk_label_new(mac_cstr)
 	gtk_label_set_markup(
@@ -99,22 +97,22 @@ build_device_card :: proc(device: Device, state: ^App_State, device_idx: int) ->
 
 	// Fan count
 	fan_label := auto_cast gtk_label_new(
-		fmt.ctprintf("%d Fan%s", device.fan_count, device.fan_count == 1 ? "" : "s"),
+		fmt.ctprintf("%d Fan%s", led_device.fan_count, led_device.fan_count == 1 ? "" : "s"),
 	)
 	gtk_label_set_markup(
 		auto_cast fan_label,
-		fmt.ctprintf("<span size='9000'>%d Fan%s</span>", device.fan_count, device.fan_count == 1 ? "" : "s"),
+		fmt.ctprintf("<span size='9000'>%d Fan%s</span>", led_device.fan_count, led_device.fan_count == 1 ? "" : "s"),
 	)
 	gtk_label_set_xalign(auto_cast fan_label, 0.0)
 	gtk_box_append(auto_cast visual_box, fan_label)
 
 	// LED count
 	led_label := auto_cast gtk_label_new(
-		fmt.ctprintf("%d LEDs", device.led_count),
+		fmt.ctprintf("%d LEDs", led_device.led_count),
 	)
 	gtk_label_set_markup(
 		auto_cast led_label,
-		fmt.ctprintf("<span size='9000'>%d LEDs</span>", device.led_count),
+		fmt.ctprintf("<span size='9000'>%d LEDs</span>", led_device.led_count),
 	)
 	gtk_label_set_xalign(auto_cast led_label, 0.0)
 	gtk_widget_set_hexpand(led_label, true)
@@ -126,24 +124,24 @@ build_device_card :: proc(device: Device, state: ^App_State, device_idx: int) ->
 
 	// Channel
 	channel_label := auto_cast gtk_label_new(
-		fmt.ctprintf("Ch %d", device.channel),
+		fmt.ctprintf("Ch %d", led_device.channel),
 	)
 	gtk_label_set_markup(
 		auto_cast channel_label,
-		fmt.ctprintf("<span size='9000'>Ch %d</span>", device.channel),
+		fmt.ctprintf("<span size='9000'>Ch %d</span>", led_device.channel),
 	)
 	gtk_label_set_xalign(auto_cast channel_label, 0.0)
 	gtk_widget_set_hexpand(channel_label, true)
 	gtk_box_append(auto_cast info_box, channel_label)
 
 	// Binding status (color-coded)
-	status_text: cstring = device.bound ? "Bound" : "Unbound"
+	status_text: cstring = led_device.bound ? "Bound" : "Unbound"
 	status_label := auto_cast gtk_label_new(status_text)
 	gtk_label_set_markup(
 		auto_cast status_label,
 		fmt.ctprintf(
 			"<span size='9000' weight='bold' foreground='%s'>%s</span>",
-			device.bound ? "#26a269" : "#e5a50a",
+			led_device.bound ? "#26a269" : "#e5a50a",
 			status_text,
 		),
 	)

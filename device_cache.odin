@@ -19,15 +19,16 @@ Device_Cache_Error :: enum {
 
 // JSON-serializable device info
 Device_Cache_Entry :: struct {
-	mac_str:       string,
-	dev_type_name: string,
-	channel:       u8,
-	bound_to_us:   bool,
-	fan_num:       u8,
-	rx_type:       u8,
-	timestamp:     u32,
-	fan_types:     [4]u8,
-	has_lcd:       bool,
+	mac_str:           string,
+	dev_type_name:     string,
+	channel:           u8,
+	bound_to_us:       bool,
+	fan_num:           u8,
+	rx_type:           u8,
+	timestamp:         u32,
+	fan_types:         [4]u8,
+	has_lcd:           bool,
+	usb_serial_number: string,  // USB serial for LCD devices (empty if no LCD)
 }
 
 Device_Cache :: struct {
@@ -61,15 +62,16 @@ device_to_cache_entry :: proc(device: RF_Device_Info) -> Device_Cache_Entry {
 	}
 
 	return Device_Cache_Entry{
-		mac_str       = device.mac_str,
-		dev_type_name = device.dev_type_name,
-		channel       = device.channel,
-		bound_to_us   = device.bound_to_us,
-		fan_num       = device.fan_num,
-		rx_type       = device.rx_type,
-		timestamp     = device.timestamp,
-		fan_types     = device.fan_types,
-		has_lcd       = has_lcd,
+		mac_str           = device.mac_str,
+		dev_type_name     = device.dev_type_name,
+		channel           = device.channel,
+		bound_to_us       = device.bound_to_us,
+		fan_num           = device.fan_num,
+		rx_type           = device.rx_type,
+		timestamp         = device.timestamp,
+		fan_types         = device.fan_types,
+		has_lcd           = has_lcd,
+		usb_serial_number = device.usb_serial_number,
 	}
 }
 

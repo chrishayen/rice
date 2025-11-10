@@ -13,8 +13,14 @@ on_initial_poll :: proc "c" (user_data: rawptr) -> c.bool {
 	context = runtime.default_context()
 	state := cast(^App_State)user_data
 
-	// Poll devices from service
+	// Poll LED devices from service
+	poll_led_devices(state)
+
+	// Also populate old unified list for compatibility
 	poll_devices_from_service(state)
+
+	// Enumerate LCD devices independently
+	enumerate_usb_lcd_devices(state)
 
 	// Rebuild device list
 	rebuild_device_list(state)
@@ -74,7 +80,7 @@ build_device_panel :: proc(state: ^App_State) -> GtkWidget {
 	return box
 }
 
-// Rebuild device list from current state.devices
+// Rebuild device list from current state.led_devices (LED-only)
 rebuild_device_list :: proc(state: ^App_State) {
 	if state.device_list_box == nil {
 		return
@@ -94,17 +100,17 @@ rebuild_device_list :: proc(state: ^App_State) {
 	clear(&state.unbind_buttons)
 	clear(&state.selected_devices)
 
-	// Add new device cards
+	// Add new LED device cards
 	device_idx := 0
-	for device in state.devices {
-		if device.rx_type == 255 do continue
+	for led_device in state.led_devices {
+		if led_device.rx_type == 255 do continue
 
-		// Add device card
-		card := build_device_card(device, state, device_idx)
+		// Add LED device card
+		card := build_device_card(led_device, state, device_idx)
 		gtk_box_append(state.device_list_box, card)
 
 		// Add bind button (only for unbound devices)
-		if !device.bound {
+		if !led_device.bound {
 			bind_button := auto_cast gtk_button_new_with_label("Bind")
 			gtk_widget_add_css_class(bind_button, "suggested-action")
 			gtk_widget_set_margin_start(bind_button, 12)
@@ -125,7 +131,7 @@ rebuild_device_list :: proc(state: ^App_State) {
 		}
 
 		// Add unbind button (only for bound devices)
-		if device.bound {
+		if led_device.bound {
 			unbind_button := auto_cast gtk_button_new_with_label("Unbind")
 			gtk_widget_add_css_class(unbind_button, "destructive-action")
 			gtk_widget_set_margin_start(unbind_button, 12)
@@ -149,10 +155,7 @@ rebuild_device_list :: proc(state: ^App_State) {
 		device_idx += 1
 	}
 
-	// Enumerate USB LCD devices for mapping
-	enumerate_usb_lcd_devices(state)
-
-	// Update LCD fan list when devices change
+	// Update LCD fan list when LCD devices change
 	update_lcd_fan_list(state)
 
 	// Redraw LCD preview to reflect new state
@@ -196,6 +199,114 @@ on_select_all_clicked :: proc "c" (button: GtkButton, user_data: rawptr) {
 }
 
 // Poll devices from service via socket
+// Poll LED devices from service (new separated version)
+poll_led_devices :: proc(state: ^App_State) {
+	// Get socket path
+	socket_path, path_err := get_socket_path()
+	defer delete(socket_path)
+
+	if path_err != .None {
+		log_warn("Failed to get socket path: %v", path_err)
+		return
+	}
+
+	// Connect to service
+	client, connect_err := connect_to_server(socket_path)
+	defer close_client(&client)
+
+	if connect_err != .None {
+		log_warn("Failed to connect to service: %v (is service running?)", connect_err)
+		return
+	}
+
+	// Send Get_Devices request
+	request := IPC_Message {
+		type    = .Get_Devices,
+		payload = "",
+	}
+
+	send_err := send_message(client.socket_fd, request)
+	if send_err != .None {
+		log_warn("Failed to send Get_Devices request: %v", send_err)
+		return
+	}
+
+	// Receive response
+	response, recv_err := receive_message(client.socket_fd)
+	if recv_err != .None {
+		log_warn("Failed to receive devices response: %v", recv_err)
+		return
+	}
+	defer delete(response.payload)
+
+	if response.type != .Devices_Response {
+		log_warn("Unexpected response type: %v", response.type)
+		return
+	}
+
+	// Parse JSON response
+	payload_bytes := transmute([]u8)response.payload
+	log_debug("Received payload (%d bytes): %s", len(payload_bytes), response.payload)
+
+	cached_devices: []Device_Cache_Entry
+	unmarshal_err := json.unmarshal(payload_bytes, &cached_devices)
+	if unmarshal_err != nil {
+		log_warn("Failed to unmarshal devices: %v", unmarshal_err)
+		log_debug("Payload was: %s", response.payload)
+		return
+	}
+	defer delete(cached_devices)
+
+	// Convert to UI LED Device format (LED-only, no LCD fields)
+	delete(state.led_devices)
+	state.led_devices = make([dynamic]UI_LED_Device)
+
+	for cached_dev in cached_devices {
+		// Calculate LED count based on fan types
+		led_count := 0
+		fan_count := int(cached_dev.fan_num)
+
+		// Check each fan type to determine LEDs per fan
+		for i in 0 ..< fan_count {
+			fan_type := cached_dev.fan_types[i]
+
+			// Determine LEDs for this fan based on its type
+			if fan_type >= 20 && fan_type <= 26 {
+				// SL v3 fans (20-26): 40 LEDs each
+				led_count += 40
+			} else if fan_type == 28 {
+				// TL v2 fans: 26 LEDs each
+				led_count += 26
+			} else if fan_type == 65 {
+				// LC217 LCD controller: 96 LEDs (240x240 display)
+				led_count += 96
+			} else {
+				// Default fallback based on rx_type
+				if cached_dev.rx_type == 1 {
+					led_count += 40
+				} else if cached_dev.rx_type == 2 || cached_dev.rx_type == 3 {
+					led_count += 26
+				}
+			}
+		}
+
+		led_device := UI_LED_Device {
+			mac_str       = cached_dev.mac_str,
+			rx_type       = cached_dev.rx_type,
+			channel       = cached_dev.channel,
+			bound         = cached_dev.bound_to_us,
+			led_count     = led_count,
+			fan_count     = fan_count,
+			dev_type_name = cached_dev.dev_type_name,
+		}
+
+		append(&state.led_devices, led_device)
+	}
+
+	log_info("Loaded %d LED devices from service", len(state.led_devices))
+}
+
+// Old unified device polling (to be removed after migration)
 poll_devices_from_service :: proc(state: ^App_State) {
 	// Get socket path
 	socket_path, path_err := get_socket_path()

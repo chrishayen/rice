@@ -339,7 +339,9 @@ App_State :: struct {
 
 	// Preview data
 	led_colors:            [dynamic][3]u8,
-	devices:               [dynamic]Device,
+	led_devices:           [dynamic]UI_LED_Device,  // LED/RF devices
+	lcd_devices:           [dynamic]UI_LCD_Device,  // LCD/USB devices
+	devices:               [dynamic]Device,         // Old unified list (to be removed)
 	selected_devices:      [dynamic]bool,
 
 	// 3D model rendering
@@ -361,8 +363,8 @@ App_State :: struct {
 	lcd_frames_dropdown:      GtkDropDown,
 	lcd_frames_row:           AdwActionRow,  // Row containing frames selection, for updating subtitle
 	lcd_preview_area:         GtkDrawingArea,
-	selected_lcd_device:      int,  // Index into devices array, -1 if none selected
-	selected_lcd_fan:         int,  // Fan index within the device, -1 if none selected
+	selected_lcd_device:      string,  // Serial number of selected LCD device, "" if none selected
+	selected_lcd_fan:         int,     // Fan index within the device, -1 if none selected
 	available_frame_sequences: [dynamic]string,  // List of discovered frame sequences
 	usb_lcd_devices:          [dynamic]USB_LCD_Device,  // USB LCD devices indexed by rx_type
 
@@ -380,6 +382,26 @@ App_State :: struct {
 	lcd_preview_fps:       f32,                     // Playback FPS
 }
 
+// UI LED Device (RF-based, identified by MAC address)
+UI_LED_Device :: struct {
+	mac_str:       string,
+	rx_type:       u8,
+	channel:       u8,
+	bound:         bool,
+	led_count:     int,
+	fan_count:     int,
+	dev_type_name: string,
+}
+
+// UI LCD Device (USB-based, identified by serial number)
+UI_LCD_Device :: struct {
+	serial_number: string,
+	fan_count:     int,
+	fan_types:     [4]u8,
+	friendly_name: string,
+}
+
+// Old unified Device struct (to be removed after migration)
 Device :: struct {
 	mac_str:       string,
 	rx_type:       u8,
@@ -441,7 +463,7 @@ run_ui :: proc() {
 	state.device_toggle_buttons = make([dynamic]GtkToggleButton)
 	state.bind_buttons = make([dynamic]GtkWidget)
 	state.unbind_buttons = make([dynamic]GtkWidget)
-	state.selected_lcd_device = -1
+	state.selected_lcd_device = ""
 	state.selected_lcd_fan = -1
 	state.usb_lcd_devices = make([dynamic]USB_LCD_Device)
 
@@ -979,7 +1001,7 @@ draw_lcd_preview :: proc "c" (
 				text = "No LCD fans available"
 				subtitle = "Connect SL 120 LCD fans to use this feature"
 				cairo_set_source_rgb(cr, 0.6, 0.5, 0.3)  // Yellowish tint
-			} else if state.selected_lcd_device == -1 {
+			} else if state.selected_lcd_device == "" {
 				// State 3: LCD fans available but none selected
 				text = "No LCD fan selected"
 				subtitle = "Choose a fan from the dropdown above"
@@ -1019,14 +1041,12 @@ draw_lcd_preview :: proc "c" (
 	}
 
 	// If a fan is selected, show device info at top
-	if state.selected_lcd_device >= 0 && state.selected_lcd_device < len(state.devices) {
-		device := state.devices[state.selected_lcd_device]
-
+	if state.selected_lcd_device != "" {
 		cairo_set_font_size(cr, 12)
 		cairo_set_source_rgb(cr, 0.6, 0.6, 0.6)
 
-		// Show device and fan info at top
-		info_text := fmt.tprintf("Device: %s | Fan: %d", device.mac_str, state.selected_lcd_fan)
+		// Show device serial number and fan info at top
+		info_text := fmt.tprintf("Device: %s | Fan: %d", state.selected_lcd_device, state.selected_lcd_fan)
 		info_cstr := strings.clone_to_cstring(info_text)
 		defer delete(info_cstr)
 
@@ -1034,18 +1054,6 @@ draw_lcd_preview :: proc "c" (
 		info_x := (c.double(width) - extents.width) / 2
 		cairo_move_to(cr, info_x, 30)
 		cairo_show_text(cr, info_cstr)
-
-		// Show USB mapping info
-		if usb_dev, ok := get_usb_lcd_device(state, device.rx_type); ok {
-			usb_text := fmt.tprintf("USB Bus:Address = %d:%d", usb_dev.bus, usb_dev.address)
-			usb_cstr := strings.clone_to_cstring(usb_text)
-			defer delete(usb_cstr)
-
-			cairo_text_extents(cr, usb_cstr, &extents)
-			usb_x := (c.double(width) - extents.width) / 2
-			cairo_move_to(cr, usb_x, 50)
-			cairo_show_text(cr, usb_cstr)
-		}
 	}
 
 	// Draw LCD screen border to show 400x400 area
@@ -1164,10 +1172,8 @@ update_lcd_frames_dropdown_from_path :: proc(state: ^App_State, frames_dir: stri
 load_lcd_preview_from_config :: proc(state: ^App_State, settings: App_Settings) {
 	// Load transform from LCD config for selected device and fan
 	transform := LCD_Transform{zoom_percent = 35.0} // Default
-	if state.selected_lcd_device >= 0 && state.selected_lcd_device < len(state.devices) &&
-	   state.selected_lcd_fan >= 0 {
-		device := state.devices[state.selected_lcd_device]
-		fan_transform, err := get_lcd_fan_transform(device.mac_str, state.selected_lcd_fan)
+	if state.selected_lcd_device != "" && state.selected_lcd_fan >= 0 {
+		fan_transform, err := get_lcd_fan_transform(state.selected_lcd_device, state.selected_lcd_fan)
 		if err == .None {
 			transform = fan_transform
 		}
@@ -1176,10 +1182,8 @@ load_lcd_preview_from_config :: proc(state: ^App_State, settings: App_Settings) 
 	state.lcd_preview_transform = transform
 
 	// Try to load frames from saved config
-	if state.selected_lcd_device >= 0 && state.selected_lcd_device < len(state.devices) &&
-	   state.selected_lcd_fan >= 0 {
-		device := state.devices[state.selected_lcd_device]
-		frames_dir, dir_err := get_lcd_fan_frames_dir(device.mac_str, state.selected_lcd_fan)
+	if state.selected_lcd_device != "" && state.selected_lcd_fan >= 0 {
+		frames_dir, dir_err := get_lcd_fan_frames_dir(state.selected_lcd_device, state.selected_lcd_fan)
 		defer delete(frames_dir)
 
 		if dir_err == .None && frames_dir != "" {
@@ -1193,7 +1197,7 @@ load_lcd_preview_from_config :: proc(state: ^App_State, settings: App_Settings) 
 				update_lcd_frames_dropdown_from_path(state, frames_dir)
 			}
 		} else {
-			fmt.printfln("No frames directory saved for device %s fan %d", device.mac_str, state.selected_lcd_fan)
+			fmt.printfln("No frames directory saved for device %s fan %d", state.selected_lcd_device, state.selected_lcd_fan)
 		}
 	}
 }
@@ -1763,7 +1767,7 @@ on_lcd_fan_selected :: proc "c" (dropdown: GtkDropDown, pspec: rawptr, user_data
 
 	// Index 0 is always the placeholder "Select an LCD fan..."
 	if selected == 0 {
-		state.selected_lcd_device = -1
+		state.selected_lcd_device = ""
 		state.selected_lcd_fan = -1
 		// Stop preview playback when deselecting
 		stop_lcd_preview_playback(state)
@@ -1771,26 +1775,16 @@ on_lcd_fan_selected :: proc "c" (dropdown: GtkDropDown, pspec: rawptr, user_data
 		return
 	}
 
-	// Calculate which device and fan based on selection (accounting for placeholder at index 0)
-	// Only count fans that actually have LCD screens (types 24 or 25)
-	// Index 1 = first LCD fan, index 2 = second LCD fan, etc.
+	// Calculate which LCD device and fan based on selection (accounting for placeholder at index 0)
+	// Index 1 = first LCD fan (device 0, fan 0), index 2 = second LCD fan, etc.
 	lcd_fan_count := 1  // Start at 1 because 0 is placeholder
-	for device, dev_idx in state.devices {
-		if !device.has_lcd do continue
-
-		for fan_idx in 0..<device.fan_count {
-			fan_type := device.fan_types[fan_idx]
-
-			// Only count fans with LCD capability
-			if fan_type != 24 && fan_type != 25 {
-				continue
-			}
-
+	for lcd_device in state.lcd_devices {
+		for fan_idx in 0..<lcd_device.fan_count {
 			if lcd_fan_count == selected {
-				state.selected_lcd_device = dev_idx
+				state.selected_lcd_device = lcd_device.serial_number
 				state.selected_lcd_fan = fan_idx
-				fmt.printfln("Selected LCD fan: Device %d (MAC: %s, rx_type: %d), Fan %d",
-					dev_idx, device.mac_str, device.rx_type, fan_idx)
+				fmt.printfln("Selected LCD fan: SN=%s, Fan %d",
+					lcd_device.serial_number, fan_idx)
 
 				// Stop any existing preview playback
 				stop_lcd_preview_playback(state)
@@ -1810,7 +1804,7 @@ on_lcd_fan_selected :: proc "c" (dropdown: GtkDropDown, pspec: rawptr, user_data
 	}
 
 	// If we get here, selection index was invalid - reset
-	state.selected_lcd_device = -1
+	state.selected_lcd_device = ""
 	state.selected_lcd_fan = -1
 	gtk_widget_queue_draw(auto_cast state.lcd_preview_area)
 }
@@ -1863,7 +1857,7 @@ on_lcd_apply_clicked :: proc "c" (button: GtkButton, user_data: rawptr) {
 	state := cast(^App_State)user_data
 
 	// Check if we have a selected LCD fan
-	if state.selected_lcd_device < 0 || state.selected_lcd_fan < 0 {
+	if state.selected_lcd_device == "" || state.selected_lcd_fan < 0 {
 		fmt.eprintln("No LCD fan selected")
 		return
 	}
@@ -1876,7 +1870,6 @@ on_lcd_apply_clicked :: proc "c" (button: GtkButton, user_data: rawptr) {
 	}
 
 	sequence_name := state.available_frame_sequences[selected_idx - 1]
-	device := state.devices[state.selected_lcd_device]
 
 	// Get config directory and build full path
 	config_dir, err := get_config_dir()
@@ -1889,20 +1882,20 @@ on_lcd_apply_clicked :: proc "c" (button: GtkButton, user_data: rawptr) {
 	frames_dir := fmt.aprintf("%s/lcd_frames/%s", config_dir, sequence_name)
 	defer delete(frames_dir)
 
-	// Save frames directory to config for this device/fan
-	save_err := update_lcd_fan_frames_dir(device.mac_str, state.selected_lcd_fan, frames_dir)
+	// Save frames directory to config for this device/fan (using serial number)
+	save_err := update_lcd_fan_frames_dir(state.selected_lcd_device, state.selected_lcd_fan, frames_dir)
 	if save_err != .None {
 		fmt.eprintfln("Failed to save LCD frames directory to config: %v", save_err)
 		return
 	}
 
 	fmt.printfln("Saved frames directory for device %s fan %d: %s",
-		device.mac_str, state.selected_lcd_fan, frames_dir)
+		state.selected_lcd_device, state.selected_lcd_fan, frames_dir)
 
 	// Send IPC command to service to start playback on the actual device
 	fmt.printfln("Sending LCD playback command to service...")
 	success := send_start_lcd_playback_request(
-		device.mac_str,
+		state.selected_lcd_device,  // Serial number
 		state.selected_lcd_fan,
 		frames_dir,
 		20.0, // FPS
@@ -1930,9 +1923,33 @@ get_usb_lcd_device :: proc(state: ^App_State, rx_type: u8) -> (USB_LCD_Device, b
 	return state.usb_lcd_devices[index], true
 }
 
-// Enumerate USB LCD devices and store by index
+// Enumerate USB LCD devices independently using serial numbers
 enumerate_usb_lcd_devices :: proc(state: ^App_State) {
-	clear(&state.usb_lcd_devices)
+	clear(&state.lcd_devices)
+
+	// Load device cache to know which fans have LCD screens
+	cached_devices, cache_err := load_device_cache()
+	if cache_err != .None {
+		fmt.printfln("Warning: Failed to load device cache for LCD enumeration: %v", cache_err)
+	}
+	defer {
+		for dev in cached_devices {
+			delete(dev.mac_str)
+			delete(dev.dev_type_name)
+			delete(dev.usb_serial_number)
+		}
+		delete(cached_devices)
+	}
+
+	// Build map of (usb_serial_number) -> fan_types array
+	serial_to_fans := make(map[string][4]u8)
+	defer delete(serial_to_fans)
+
+	for cached_dev in cached_devices {
+		if cached_dev.usb_serial_number != "" {
+			serial_to_fans[cached_dev.usb_serial_number] = cached_dev.fan_types
+		}
+	}
 
 	// Initialize libusb
 	ctx: rawptr
@@ -1953,7 +1970,6 @@ enumerate_usb_lcd_devices :: proc(state: ^App_State) {
 	defer libusb_free_device_list(device_list, 1)
 
 	// Enumerate all LCD devices (VID 0x1cbe, PID 0x0005)
-	index := 0
 	for i in 0..<device_count {
 		device := mem.ptr_offset(device_list, i)^
 
@@ -1969,23 +1985,53 @@ enumerate_usb_lcd_devices :: proc(state: ^App_State) {
 			continue
 		}
 
-		// Get bus and address
-		bus := int(libusb_get_bus_number(device))
-		address := int(libusb_get_device_address(device))
-
-		// Store this LCD device with its enumeration index
-		lcd_dev := USB_LCD_Device {
-			bus = bus,
-			address = address,
-			index = index,
+		// Open device to read serial number
+		usb_handle: rawptr
+		ret = libusb_open(device, &usb_handle)
+		if ret != LIBUSB_SUCCESS {
+			fmt.printfln("Warning: Failed to open LCD device (bus %d, addr %d)",
+				libusb_get_bus_number(device), libusb_get_device_address(device))
+			continue
 		}
-		append(&state.usb_lcd_devices, lcd_dev)
+		defer libusb_close(usb_handle)
 
-		fmt.printfln("Found USB LCD device: index=%d, bus=%d, address=%d", index, bus, address)
-		index += 1
+		// Read serial number
+		serial_number := get_usb_serial_number(device, usb_handle)
+		if serial_number == "" {
+			fmt.printfln("Warning: Failed to read serial number from LCD device (bus %d, addr %d)",
+				libusb_get_bus_number(device), libusb_get_device_address(device))
+			continue
+		}
+
+		// Get fan types from cache (if available)
+		fan_types, has_cache := serial_to_fans[serial_number]
+		if !has_cache {
+			// No cache data - assume all 4 fan positions might have LCD
+			// User will need to run the service to populate the cache for filtering
+			fmt.printfln("Warning: No cache data for LCD device SN=%s, showing all fan positions", serial_number)
+			fan_types = {0, 0, 0, 0}  // Unknown - will show all in dropdown and filter there
+		}
+
+		// Create friendly name (last 8 chars of serial or full serial if shorter)
+		friendly_name := serial_number
+		if len(serial_number) > 8 {
+			friendly_name = fmt.aprintf("LCD %s", serial_number[len(serial_number)-8:])
+		} else {
+			friendly_name = fmt.aprintf("LCD %s", serial_number)
+		}
+
+		lcd_dev := UI_LCD_Device {
+			serial_number = serial_number,
+			fan_count = 4,  // Maximum possible (we filter in dropdown)
+			fan_types = fan_types,  // Actual fan types from cache
+			friendly_name = friendly_name,
+		}
+		append(&state.lcd_devices, lcd_dev)
+
+		fmt.printfln("Found USB LCD device: SN=%s", serial_number)
 	}
 
-	fmt.printfln("Total USB LCD devices found: %d", len(state.usb_lcd_devices))
+	fmt.printfln("Total USB LCD devices found: %d", len(state.lcd_devices))
 }
 
 // Update LCD fan dropdown list
@@ -2000,22 +2046,20 @@ update_lcd_fan_list :: proc(state: ^App_State) {
 	// Always add a placeholder as first entry
 	gtk_string_list_append(fan_list, "Select an LCD fan...")
 
-	// Add LCD fans from devices
-	for device, dev_idx in state.devices {
-		if !device.has_lcd do continue
+	// Add LCD fans from LCD devices (only fans that have LCD screens)
+	for lcd_device in state.lcd_devices {
+		// Check each fan position
+		for fan_idx in 0..<4 {
+			fan_type := lcd_device.fan_types[fan_idx]
 
-		// Add only fans that actually have LCD screens (types 24 or 25)
-		for fan_idx in 0..<device.fan_count {
-			fan_type := device.fan_types[fan_idx]
-
-			// Only add if this specific fan has LCD capability
-			if fan_type != 24 && fan_type != 25 {
+			// If fan types are unknown (0), show all fan positions
+			// Otherwise only add fans with LCD capability (types 24 or 25)
+			if fan_type != 0 && fan_type != 24 && fan_type != 25 {
 				continue
 			}
 
-			// Format: "Device XX:XX:XX - Fan N (USB rx_type)"
-			mac_short := device.mac_str[len(device.mac_str)-8:] if len(device.mac_str) >= 8 else device.mac_str
-			label := fmt.aprintf("Device %s - Fan %d (USB %d)", mac_short, fan_idx, device.rx_type)
+			// Format: "LCD XXXXXXXX - Fan N"
+			label := fmt.aprintf("%s - Fan %d", lcd_device.friendly_name, fan_idx)
 			defer delete(label)
 
 			label_cstr := strings.clone_to_cstring(label)
@@ -2030,7 +2074,7 @@ update_lcd_fan_list :: proc(state: ^App_State) {
 
 	// Reset to placeholder
 	gtk_drop_down_set_selected(state.lcd_fan_dropdown, 0)
-	state.selected_lcd_device = -1
+	state.selected_lcd_device = ""
 	state.selected_lcd_fan = -1
 }
 
